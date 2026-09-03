@@ -37,8 +37,17 @@ from pydantic import BaseModel, Field
 from supabase import AsyncClient, create_async_client
 
 ADMIN_KEY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admin_key.txt")
-STRIPE_BASE = os.environ.get("CUSTOM_CRED_API_STRIPE_COM_URL", "").rstrip("/")
-STRIPE_KEY_HEADER = {"x-api-key": os.environ.get("CUSTOM_CRED_API_STRIPE_COM_TOKEN", "")}
+# Production (Render, or any real host): call api.stripe.com directly with a standard
+# Authorization: Bearer <secret key> header, configured via the STRIPE_SECRET_KEY env var.
+# Sandbox/dev fallback: route through the agent's custom-credentials proxy instead, which
+# injects CUSTOM_CRED_API_STRIPE_COM_URL/TOKEN when start_server(api_credentials=[...]) is used.
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+if STRIPE_SECRET_KEY:
+    STRIPE_BASE = "https://api.stripe.com"
+    STRIPE_KEY_HEADER = {"Authorization": f"Bearer {STRIPE_SECRET_KEY}"}
+else:
+    STRIPE_BASE = os.environ.get("CUSTOM_CRED_API_STRIPE_COM_URL", "").rstrip("/")
+    STRIPE_KEY_HEADER = {"x-api-key": os.environ.get("CUSTOM_CRED_API_STRIPE_COM_TOKEN", "")}
 
 SECONDS_PER_DAY = 86400
 
@@ -72,6 +81,7 @@ STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 WEBHOOK_TOLERANCE_SECONDS = 300  # reject signed events whose timestamp has drifted this far
 
 supabase: AsyncClient | None = None
+http_client: httpx.AsyncClient | None = None
 
 
 def _load_or_create_admin_key() -> str:
@@ -143,11 +153,13 @@ async def rate_limit(key: str, limit: int, window_seconds: int) -> None:
 
 @asynccontextmanager
 async def lifespan(app):
-    global supabase
+    global supabase, http_client
     if not SUPABASE_URL or not SUPABASE_ANON_KEY:
         raise RuntimeError("SUPABASE_URL and SUPABASE_ANON_KEY must be set")
     supabase = await create_async_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+    http_client = httpx.AsyncClient(timeout=20)
     yield
+    await http_client.aclose()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -226,8 +238,7 @@ async def stripe_request(method: str, path: str, data: dict | None = None, param
     if not STRIPE_BASE:
         raise HTTPException(500, "Stripe credential not configured on the server")
     url = f"{STRIPE_BASE}{path}"
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.request(method, url, data=data, params=params, headers=STRIPE_KEY_HEADER)
+    resp = await http_client.request(method, url, data=data, params=params, headers=STRIPE_KEY_HEADER)
     if resp.status_code >= 400:
         try:
             detail = resp.json().get("error", {}).get("message", resp.text)
