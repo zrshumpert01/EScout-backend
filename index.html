@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<title>EScout — AI Whitetail Scouting & Hunting Maps</title>
+<meta name="description" content="EScout is a subscription hunting map app with land ownership data, offline maps, and Scout AI — an AI terrain engine that finds likely whitetail bedding areas, travel corridors, and stand sites from free public data." />
+
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://api.fontshare.com/v2/css?f[]=cabinet-grotesk@700,800&f[]=general-sans@400,500,600,700&display=swap" rel="stylesheet" />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+
+<link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet" />
+<script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
+
+<link rel="stylesheet" href="./base.css?v=bf7801f5" />
+<link rel="stylesheet" href="./style.css?v=bf7801f5" />
+
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2314120e'/%3E%3Crect x='2' y='2' width='28' height='28' rx='6' fill='none' stroke='%236a9169' stroke-width='1' opacity='0.35'/%3E%3Cpath d='M6 22l6-11 4 6 4-9 6 14' fill='none' stroke='%236a9169' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='16' cy='8' r='1.6' fill='%236a9169'/%3E%3C/svg%3E" />
+
+<link rel="manifest" href="./manifest.json" />
+<link rel="apple-touch-icon" href="./assets/icons/apple-touch-icon.png?v=bf7801f5" />
+<meta name="theme-color" content="#14120e" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="EScout" />
+</head>
+<body>
+
+<div id="app">
+  <!-- ================= TOP BAR ================= -->
+  <header class="topbar">
+    <div class="brand" aria-label="EScout">
+      <svg viewBox="0 0 32 32" fill="none" aria-hidden="true">
+        <rect x="1" y="1" width="30" height="30" rx="8" stroke="currentColor" stroke-width="1.6" opacity="0.35"/>
+        <path d="M6 22l6-11 4 6 4-9 6 14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="16" cy="8" r="1.6" fill="currentColor"/>
+      </svg>
+      <span class="brand-name">E<span>Scout</span></span>
+    </div>
+
+    <button class="icon-btn mobile-tools-btn" id="mobileToolsBtn" aria-label="Search and map style" aria-haspopup="true" aria-expanded="false">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+    </button>
+
+    <div class="topbar-tools" id="topbarTools">
+      <label class="search-wrap">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+        <input id="searchInput" type="text" placeholder="Search address, coordinates, or land…" aria-label="Search the map" />
+      </label>
+
+      <div class="basemap-pills" role="group" aria-label="Basemap style">
+        <button class="active" data-style="satellite">Satellite</button>
+        <button data-style="hybrid">Hybrid</button>
+        <button data-style="topo">Topo</button>
+      </div>
+
+      <!-- Kept inside topbarTools (not a topbar sibling) so this reaches mobile visitors too:
+           topbarTools lays out as invisible "display:contents" on desktop (same position as
+           before) but collapses into the search/basemap dropdown on narrow screens. Seasonal
+           imagery (Leaf-On/Fall/Winter) moved out of this row into the Intel Layers panel
+           (see renderIntel() in app.js) so it lives alongside the other data-layer toggles
+           instead of the search bar. -->
+      <div class="season-select" id="vintageSelect">
+        <button class="season-trigger" id="vintageTrigger" aria-haspopup="true" aria-expanded="false" title="Clouds in the way? Try an older cloud-free capture.">
+          <svg class="season-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 10h-1.26A8 8 0 109 20h9a5 5 0 000-10z"/></svg>
+          <span id="vintageTriggerLabel">Live</span>
+          <svg class="season-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+        <div class="season-menu" id="vintageMenu" role="menu" aria-label="Imagery capture date">
+          <div class="season-menu-hint">Clouds over your spot? Try another capture date.</div>
+          <button class="active" data-vintage="live" role="menuitem">
+            <span class="season-name">Live (Newest)</span><span class="season-desc">Current default</span>
+          </button>
+          <button data-vintage="v2026-06" role="menuitem"><span class="season-name">Jun 2026</span></button>
+          <button data-vintage="v2026-04" role="menuitem"><span class="season-name">Apr 2026</span></button>
+          <button data-vintage="v2026-01" role="menuitem"><span class="season-name">Jan 2026</span></button>
+          <button data-vintage="v2025-09" role="menuitem"><span class="season-name">Sep 2025</span></button>
+          <button data-vintage="v2025-05" role="menuitem"><span class="season-name">May 2025</span></button>
+          <button data-vintage="v2025-01" role="menuitem"><span class="season-name">Jan 2025</span></button>
+          <button data-vintage="v2024-09" role="menuitem"><span class="season-name">Sep 2024</span></button>
+        </div>
+      </div>
+    </div>
+
+    <div class="top-right">
+      <div class="hud-chip" id="windHudChip" title="Live wind for this view — the arrow points downwind, the direction your scent carries">
+        <svg class="wind-dir-arrow" id="windDirArrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 19V5M12 5l-5 5M12 5l5 5"/></svg>
+        Wind <strong id="windHudLabel">Reading…</strong>
+      </div>
+      <div class="hud-chip hud-chip-moon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v2M12 19v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M2 12h2M20 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"/><circle cx="12" cy="12" r="4.5"/></svg>
+        Moon <strong>Waning · 38%</strong>
+      </div>
+      <button class="btn plan-chip is-free" id="planChipBtn" data-open-pricing>
+        <span class="plan-dot"></span>
+        <span id="planChipLabel">Free Plan</span>
+      </button>
+      <button class="icon-btn" id="themeToggle" aria-label="Toggle color theme"></button>
+      <button class="icon-btn" aria-label="Account">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4.5 3.5-7 8-7s8 2.5 8 7"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ================= STAGE ================= -->
+  <main class="stage">
+    <div id="map"></div>
+    <div class="map-tone" aria-hidden="true"></div>
+    <div class="map-vignette" aria-hidden="true"></div>
+    <div class="tile-loading" id="tileLoading" aria-hidden="true"><span class="tile-loading-spinner"></span></div>
+
+    <div class="scan-overlay" id="scanOverlay" aria-hidden="true">
+      <div class="scan-ring"></div>
+      <div class="scan-sweep"></div>
+      <div class="scan-caption" id="scanCaption">Pulling elevation & slope — USGS 3DEP…</div>
+    </div>
+
+    <div class="mode-banner" id="modeBanner">
+      <span id="modeBannerText">Waypoint mode — <strong>tap the map</strong> to drop a pin</span>
+      <button id="modeBannerClose" aria-label="Exit waypoint mode">✕</button>
+    </div>
+
+    <div class="waypoint-picker" id="waypointPicker" role="menu" aria-label="Choose a waypoint type">
+      <div class="wp-picker-title">Drop a waypoint</div>
+      <div class="wp-grid" id="wpGrid"></div>
+    </div>
+
+    <div class="measure-readout" id="measureReadout" aria-hidden="true">
+      <div class="measure-readout-row">
+        <span class="measure-label">Distance</span>
+        <span class="measure-value-group">
+          <span class="measure-value" id="measureDistance">0 ft</span>
+          <button type="button" class="unit-toggle-btn" id="distUnitToggle" data-unit="ft" aria-label="Switch distance unit to yards">yd</button>
+        </span>
+      </div>
+      <div class="measure-readout-row" id="measureAreaRow" hidden>
+        <span class="measure-label">Area</span>
+        <span class="measure-value" id="measureArea">0 ac</span>
+      </div>
+      <div class="measure-actions">
+        <button type="button" id="measureUndoBtn" disabled>Undo</button>
+        <button type="button" id="measureClearBtn" disabled>Clear</button>
+        <button type="button" id="measureDoneBtn" class="btn-primary">Done</button>
+      </div>
+    </div>
+
+    <div class="measure-readout" id="areaSelectReadout" aria-hidden="true">
+      <div class="measure-readout-row">
+        <span class="measure-label">Scan Area</span>
+        <span class="measure-value" id="areaSelectValue">0 points</span>
+      </div>
+      <div class="measure-hint" id="areaSelectHint">Tap the map to trace a boundary</div>
+      <div class="measure-actions">
+        <button type="button" id="areaSelectUndoBtn" disabled>Undo</button>
+        <button type="button" id="areaSelectClearBtn" disabled>Clear</button>
+        <button type="button" id="areaSelectDoneBtn" class="btn-primary" disabled>Use This Area</button>
+      </div>
+    </div>
+
+    <!-- Rail dock -->
+    <nav class="rail" aria-label="Map tools">
+      <button class="rail-btn" id="waypointBtn" aria-label="Waypoint tool">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s7-6.5 7-12a7 7 0 10-14 0c0 5.5 7 12 7 12z"/><circle cx="12" cy="9" r="2.5"/></svg>
+        <span class="rail-tip">Waypoint</span>
+      </button>
+      <button class="rail-btn" id="linesBtn" aria-label="Lines and area tool">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 17l6-9 4 5 6-8"/><circle cx="4" cy="17" r="1.4" fill="currentColor" stroke="none"/><circle cx="20" cy="5" r="1.4" fill="currentColor" stroke="none"/></svg>
+        <span class="rail-tip">Lines &amp; Area</span>
+      </button>
+      <button class="rail-btn" id="areaSelectBtn" aria-label="Select scan area tool">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 8V5a1 1 0 011-1h3M20 8V5a1 1 0 00-1-1h-3M4 16v3a1 1 0 001 1h3M20 16v3a1 1 0 01-1 1h-3" stroke-linecap="round"/><circle cx="12" cy="12" r="2.6"/></svg>
+        <span class="rail-tip">Select Scan Area</span>
+      </button>
+      <button class="rail-btn" data-tab="intel" aria-label="Intel layers">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l9 5-9 5-9-5 9-5z"/><path d="M3 13l9 5 9-5"/></svg>
+        <span class="rail-tip">Intel Layers</span>
+      </button>
+
+      <div class="rail-divider"></div>
+
+      <button class="rail-btn scout" data-tab="scout" aria-label="Scout AI">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2 2M17 17l2 2M4.9 19.1l2-2M17 7l2-2"/><circle cx="12" cy="12" r="4"/></svg>
+        <span class="rail-tip">Scout AI</span>
+      </button>
+
+      <div class="rail-divider"></div>
+
+      <button class="rail-btn" data-tab="cams" aria-label="Trail cameras">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="15" height="12" rx="2"/><path d="M17 10l5-3v10l-5-3"/></svg>
+        <span class="rail-tip">Trail Cams</span>
+      </button>
+      <button class="rail-btn" data-tab="journal" aria-label="Hunt journal">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h13a3 3 0 013 3v13H7a3 3 0 01-3-3V4z"/><path d="M4 4v13a3 3 0 003 3" opacity="0"/><path d="M8 9h8M8 13h8"/></svg>
+        <span class="rail-tip">Hunt Journal</span>
+      </button>
+      <button class="rail-btn" id="offlineBtn" aria-label="Download offline map">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
+        <span class="rail-tip">Save Offline</span>
+      </button>
+      <button class="rail-btn" id="installBtn" aria-label="Get the app">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="2" width="12" height="20" rx="2.5"/><path d="M11 18h2"/></svg>
+        <span class="rail-tip">Get App</span>
+      </button>
+
+      <div class="rail-divider"></div>
+
+      <button class="rail-btn" id="settingsBtn" aria-label="Settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.9l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.9-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1-1.6 1.7 1.7 0 00-1.9.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.9 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.6-1 1.7 1.7 0 00-.3-1.9l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.9.3H9a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.6 1.7 1.7 0 001.9-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.9V9a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg>
+        <span class="rail-tip">Settings</span>
+      </button>
+    </nav>
+
+    <!-- Right panel -->
+    <aside class="panel" id="panel">
+      <div class="panel-head">
+        <div>
+          <div class="panel-title" id="panelTitle">Intel Layers</div>
+          <div class="panel-sub" id="panelSub">Toggle map data for this view</div>
+        </div>
+        <button class="icon-btn" id="panelClose" aria-label="Close panel">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="panel-body" id="panelBody"></div>
+    </aside>
+
+    <div class="toast-stack" id="toastStack"></div>
+  </main>
+</div>
+
+<!-- ================= PRICING MODAL ================= -->
+<div class="modal-backdrop" id="pricingModal">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="pricingHeading">
+    <button class="icon-btn modal-close" id="pricingClose" aria-label="Close pricing">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+    </button>
+    <div class="modal-head">
+      <h2 id="pricingHeading">Choose your membership</h2>
+      <p>Free gets you the map, waypoints, and layer browsing. Premium unlocks Scout AI, private land boundaries, and topo terrain data — everywhere you hunt.</p>
+    </div>
+    <div class="demo-note" id="pricingSecureNote">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+      <span>Secure checkout powered by Stripe. Cancel or change plans anytime from Manage Billing below.</span>
+    </div>
+    <div class="plans" id="plansGrid">
+      <div class="plan" data-plan="free">
+        <div class="plan-name">Free</div>
+        <div class="plan-tag">Explore the map</div>
+        <div class="plan-price">$0<span> /mo</span></div>
+        <ul class="plan-feats">
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg><span>Satellite &amp; hybrid basemaps</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg><span>Terrain, habitat &amp; wind layers</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg><span>Unlimited custom waypoints</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg><span>Trail cameras &amp; hunt journal</span></li>
+        </ul>
+        <button class="btn btn-ghost plan-cta" data-cta="free">Continue free</button>
+      </div>
+      <div class="plan featured" data-plan="premium">
+        <div class="plan-badge">Unlock everything</div>
+        <div class="plan-name">Premium</div>
+        <div class="plan-tag">Scout AI, property lines &amp; topo — everywhere</div>
+        <div class="plan-price">$5<span> /mo</span></div>
+        <ul class="plan-feats">
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg><span>Everything in Free</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg><span><strong>Scout AI</strong> terrain scans, anywhere you hunt</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg><span>Private land boundaries — <strong>all 50 states</strong></span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg><span><strong>Topo basemap</strong> &amp; contour/elevation layer</span></li>
+        </ul>
+        <button class="btn btn-amber plan-cta" data-cta="premium">Subscribe — $5/mo</button>
+      </div>
+    </div>
+    <div class="trial-note">
+      <button class="btn btn-ghost" id="manageBillingBtn" type="button" style="display:none;">Manage billing</button>
+      <span id="trialNoteText">Secure payments via Stripe · cancel anytime</span>
+    </div>
+    <div class="redeem-row" id="redeemRow">
+      <button class="link-btn" id="redeemToggle" type="button">Have a complimentary code?</button>
+      <div class="redeem-form" id="redeemForm" style="display:none;">
+        <input class="redeem-input" id="redeemInput" type="text" placeholder="Enter code" autocapitalize="off" autocorrect="off" spellcheck="false" />
+        <button class="btn btn-ghost" id="redeemSubmit" type="button">Apply</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ================= INSTALL / DOWNLOAD MODAL ================= -->
+<div class="modal-backdrop" id="installModal">
+  <div class="modal install-modal" role="dialog" aria-modal="true" aria-labelledby="installHeading">
+    <button class="icon-btn modal-close" id="installClose" aria-label="Close install options">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+    </button>
+    <div class="modal-head">
+      <h2 id="installHeading">Get EScout as an app</h2>
+      <p>Install it for a full-screen, offline-ready app experience, or download the source to run it yourself.</p>
+    </div>
+
+    <div class="install-section" id="installAppSection">
+      <div class="install-row">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="2" width="14" height="20" rx="2"/><path d="M11 18h2"/></svg>
+        <div>
+          <div class="install-row-title">Install the app</div>
+          <div class="install-row-desc" id="installStatusText">Adds EScout to your home screen or desktop with its own icon — opens full-screen, no browser bar.</div>
+        </div>
+      </div>
+      <button class="btn btn-amber" id="installActionBtn">Install EScout</button>
+      <div class="install-manual" id="installManualHint"></div>
+      <div class="share-link-row install-share-link-row">
+        <input type="text" id="installLinkInput" readonly aria-label="Shareable install link" />
+        <button class="btn btn-ghost" id="installLinkCopyBtn" type="button">Copy link</button>
+      </div>
+      <p class="share-modal-hint">Send this link to a hunting buddy — opening it takes them straight to this install prompt on their own phone.</p>
+    </div>
+
+    <div class="install-divider"></div>
+
+    <div class="install-section">
+      <div class="install-row">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
+        <div>
+          <div class="install-row-title">Download the source code</div>
+          <div class="install-row-desc">Get the full project (HTML/CSS/JS) as a .zip to run in your own editor or local server.</div>
+        </div>
+      </div>
+      <a class="btn btn-ghost" id="downloadSourceBtn" href="./escout-source.zip" download="escout-source.zip">Download .zip</a>
+    </div>
+  </div>
+</div>
+
+<!-- ================= SHARE WAYPOINTS MODAL ================= -->
+<div class="modal-backdrop" id="shareModal">
+  <div class="modal share-modal" role="dialog" aria-modal="true" aria-labelledby="shareHeading">
+    <button class="icon-btn modal-close" id="shareClose" aria-label="Close share link">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+    </button>
+    <div class="modal-head">
+      <h2 id="shareHeading">Share your pins</h2>
+      <p id="shareModalCount">Sharing 1 pin</p>
+    </div>
+    <div class="share-link-row">
+      <input type="text" id="shareLinkInput" readonly aria-label="Shareable pin link" />
+      <button class="btn btn-amber" id="shareCopyBtn" type="button">Copy link</button>
+    </div>
+    <p class="share-modal-hint">Anyone who opens this link gets their own copy of these pins added to their map — your originals aren't affected.</p>
+  </div>
+</div>
+
+<script src="./app.js?v=bf7801f5"></script>
+</body>
+</html>
