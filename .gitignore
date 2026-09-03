@@ -1,0 +1,7 @@
+escout-source.zip
+subscriptions.db
+admin_key.txt
+.env
+__pycache__/
+*.pyc
+dist/
