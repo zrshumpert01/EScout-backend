@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>EScout — Admin: Complimentary Access</title>
+<meta name="robots" content="noindex, nofollow" />
+
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://api.fontshare.com/v2/css?f[]=cabinet-grotesk@700,800&f[]=general-sans@400,500,600,700&display=swap" rel="stylesheet" />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+
+<link rel="stylesheet" href="./base.css?v=26f7426b" />
+<link rel="stylesheet" href="./style.css?v=26f7426b" />
+
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2314120e'/%3E%3Crect x='2' y='2' width='28' height='28' rx='6' fill='none' stroke='%236a9169' stroke-width='1' opacity='0.35'/%3E%3Cpath d='M6 22l6-11 4 6 4-9 6 14' fill='none' stroke='%236a9169' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='16' cy='8' r='1.6' fill='%236a9169'/%3E%3C/svg%3E" />
+<meta name="theme-color" content="#14120e" />
+
+<style>
+  body { background: var(--color-bg); color: var(--color-text); font-family: var(--font-body); min-height: 100dvh; }
+  .admin-wrap { max-width: 880px; margin: 0 auto; padding: var(--space-8) var(--space-5) var(--space-24); }
+  .admin-brand { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-8); }
+  .admin-brand svg { width: 30px; height: 30px; color: var(--color-primary); }
+  .admin-brand span { font-family: var(--font-display); font-weight: 800; font-size: var(--text-lg); letter-spacing: -0.01em; }
+  .admin-brand span b { color: var(--color-primary); font-weight: 800; }
+  h1 { font-family: var(--font-display); font-size: var(--text-xl); font-weight: 800; margin-bottom: var(--space-2); }
+  .admin-sub { color: var(--color-text-muted); font-size: var(--text-sm); margin-bottom: var(--space-8); max-width: 60ch; }
+  .card { background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-lg); padding: var(--space-6); margin-bottom: var(--space-6); }
+  .card h2 { font-family: var(--font-display); font-size: var(--text-lg); font-weight: 700; margin-bottom: var(--space-4); }
+  label { display: block; font-size: var(--text-xs); color: var(--color-text-muted); margin-bottom: var(--space-1); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
+  input[type="text"], input[type="password"], input[type="number"] {
+    width: 100%; background: var(--color-surface-2); border: 1px solid var(--color-border); border-radius: var(--radius-md);
+    padding: var(--space-3); color: var(--color-text); font-family: var(--font-body); font-size: var(--text-sm); margin-bottom: var(--space-4);
+  }
+  input:focus { outline: 2px solid var(--color-primary); outline-offset: 1px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); }
+  @media (max-width: 560px) { .row { grid-template-columns: 1fr; } }
+  button.btn-primary-admin {
+    background: var(--color-primary); color: var(--color-text-inverse); font-weight: 700; font-size: var(--text-sm);
+    border: none; border-radius: var(--radius-full); padding: var(--space-3) var(--space-6); cursor: pointer;
+    transition: background var(--transition-interactive);
+  }
+  button.btn-primary-admin:hover { background: var(--color-primary-hover); }
+  button.btn-primary-admin:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.btn-ghost-admin {
+    background: transparent; color: var(--color-text-muted); font-weight: 600; font-size: var(--text-xs);
+    border: 1px solid var(--color-border); border-radius: var(--radius-full); padding: var(--space-2) var(--space-4); cursor: pointer;
+  }
+  button.btn-ghost-admin:hover { color: var(--color-text); border-color: var(--color-text-muted); }
+  button.btn-danger-admin {
+    background: transparent; color: var(--color-error); font-weight: 600; font-size: var(--text-xs);
+    border: 1px solid var(--color-error); border-radius: var(--radius-full); padding: var(--space-2) var(--space-4); cursor: pointer;
+  }
+  button.btn-danger-admin:hover { background: var(--color-error-highlight, rgba(193,115,97,0.12)); }
+  .result-box {
+    display: none; margin-top: var(--space-4); padding: var(--space-4); background: var(--color-primary-highlight);
+    border: 1px solid var(--color-primary); border-radius: var(--radius-md);
+  }
+  .result-box.is-visible { display: block; }
+  .result-box .link-row { display: flex; gap: var(--space-2); align-items: center; margin-top: var(--space-2); flex-wrap: wrap; }
+  .result-box code {
+    font-family: var(--font-mono); font-size: var(--text-xs); background: var(--color-surface-2); padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-sm); word-break: break-all; flex: 1; min-width: 220px;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
+  th, td { text-align: left; padding: var(--space-3); border-bottom: 1px solid var(--color-divider); vertical-align: middle; }
+  th { color: var(--color-text-muted); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
+  td.mono { font-family: var(--font-mono); font-size: var(--text-xs); }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: var(--radius-full); font-size: var(--text-xs); font-weight: 700; }
+  .badge.pending { background: var(--color-amber-highlight); color: var(--color-amber); }
+  .badge.active { background: var(--color-primary-highlight); color: var(--color-primary); }
+  .badge.expired, .badge.revoked { background: var(--color-error-highlight, rgba(193,115,97,0.12)); color: var(--color-error); }
+  .empty-note { color: var(--color-text-faint); font-size: var(--text-sm); padding: var(--space-4) 0; text-align: center; }
+  .err-note { color: var(--color-error); font-size: var(--text-sm); margin-top: var(--space-2); display: none; }
+  .err-note.is-visible { display: block; }
+  .toast {
+    position: fixed; bottom: var(--space-6); left: 50%; transform: translateX(-50%) translateY(20px);
+    background: var(--color-surface-offset); border: 1px solid var(--color-border); color: var(--color-text);
+    padding: var(--space-3) var(--space-5); border-radius: var(--radius-full); font-size: var(--text-sm);
+    opacity: 0; transition: all var(--transition-interactive); pointer-events: none; z-index: 50; white-space: nowrap;
+  }
+  .toast.is-visible { opacity: 1; transform: translateX(-50%) translateY(0); }
+  #gateScreen { max-width: 380px; margin: 15vh auto 0; text-align: center; }
+  #gateScreen .card { text-align: left; }
+  #mainScreen { display: none; }
+</style>
+</head>
+<body>
+
+<div class="admin-wrap">
+  <div class="admin-brand" aria-label="EScout">
+    <svg viewBox="0 0 32 32" fill="none" aria-hidden="true">
+      <rect x="1" y="1" width="30" height="30" rx="8" stroke="currentColor" stroke-width="1.6" opacity="0.35"/>
+      <path d="M6 22l6-11 4 6 4-9 6 14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="16" cy="8" r="1.6" fill="currentColor"/>
+    </svg>
+    <span>E<b>Scout</b> Admin</span>
+  </div>
+
+  <div id="gateScreen">
+    <h1>Admin access</h1>
+    <p class="admin-sub">Enter your admin key to manage complimentary Premium access. The key was printed to the server log the first time it started, and saved to <code>admin_key.txt</code> in the project folder.</p>
+    <div class="card">
+      <label for="adminKeyInput">Admin key</label>
+      <input type="password" id="adminKeyInput" autocomplete="off" placeholder="Paste your admin key" />
+      <button class="btn-primary-admin" id="unlockBtn" style="width:100%">Unlock</button>
+      <div class="err-note" id="gateErr">Incorrect key — check the server log or admin_key.txt.</div>
+    </div>
+  </div>
+
+  <div id="mainScreen">
+    <h1>Complimentary Premium access</h1>
+    <p class="admin-sub">Generate a one-time link that grants a specific person full Premium access — nationwide property lines &amp; Scout AI — for free, for a chosen number of days. No Stripe billing is involved.</p>
+
+    <div class="card">
+      <h2>Create a new grant</h2>
+      <div class="row">
+        <div>
+          <label for="grantLabel">Label (for your reference)</label>
+          <input type="text" id="grantLabel" placeholder="e.g. Dad, hunting buddy Josh" />
+        </div>
+        <div>
+          <label for="grantDays">Duration (days)</label>
+          <input type="number" id="grantDays" value="365" min="1" max="3650" />
+        </div>
+      </div>
+      <button class="btn-primary-admin" id="createGrantBtn">Generate link</button>
+      <div class="err-note" id="createErr"></div>
+      <div class="result-box" id="resultBox">
+        <div style="font-size: var(--text-sm); font-weight: 600;">Send this link to them — opening it once activates Premium on their device:</div>
+        <div class="link-row">
+          <code id="resultLink"></code>
+          <button class="btn-ghost-admin" id="copyLinkBtn">Copy</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Existing grants</h2>
+      <div id="grantsTableWrap">
+        <div class="empty-note">Loading…</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(function () {
+  // Same placeholder pattern as app.js — publish_website rewrites __PORT_8000__ to the
+  // correct /port/8000 routing prefix on the live site; falls back to localhost for local dev.
+  const API = '__PORT_8000__'.startsWith('__') ? 'http://localhost:8000' : '__PORT_8000__';
+
+  const gateScreen = document.getElementById('gateScreen');
+  const mainScreen = document.getElementById('mainScreen');
+  const adminKeyInput = document.getElementById('adminKeyInput');
+  const unlockBtn = document.getElementById('unlockBtn');
+  const gateErr = document.getElementById('gateErr');
+  const toastEl = document.getElementById('toast');
+
+  // Kept in memory only for this page load — no localStorage/sessionStorage (unavailable in
+  // the sandboxed preview iframe, and safer for a secret key anyway). Re-enter on reload.
+  let adminKey = '';
+
+  function toast(msg) {
+    toastEl.textContent = msg;
+    toastEl.classList.add('is-visible');
+    setTimeout(() => toastEl.classList.remove('is-visible'), 2600);
+  }
+
+  async function adminFetch(path, options) {
+    const res = await fetch(`${API}${path}`, {
+      ...options,
+      headers: { ...(options && options.headers), 'X-Admin-Key': adminKey },
+    });
+    if (res.status === 401) {
+      adminKey = '';
+      showGate('Incorrect or expired key — try again.');
+      throw new Error('unauthorized');
+    }
+    if (!res.ok) {
+      let msg = 'Request failed';
+      try { msg = (await res.json()).detail || msg; } catch (e) { /* ignore */ }
+      throw new Error(msg);
+    }
+    return res.json();
+  }
+
+  function showGate(err) {
+    gateScreen.style.display = 'block';
+    mainScreen.style.display = 'none';
+    if (err) {
+      gateErr.textContent = err;
+      gateErr.classList.add('is-visible');
+    }
+  }
+
+  function showMain() {
+    gateScreen.style.display = 'none';
+    mainScreen.style.display = 'block';
+    loadGrants();
+  }
+
+  function statusBadge(status) {
+    const labelMap = { pending: 'Pending', active: 'Active', expired: 'Expired', revoked: 'Revoked' };
+    return `<span class="badge ${status}">${labelMap[status] || status}</span>`;
+  }
+
+  function fmtDate(ts) {
+    if (!ts) return '—';
+    return new Date(ts * 1000).toLocaleDateString();
+  }
+
+  async function loadGrants() {
+    const wrap = document.getElementById('grantsTableWrap');
+    try {
+      const data = await adminFetch('/api/admin/grants');
+      const grants = data.grants || [];
+      if (!grants.length) {
+        wrap.innerHTML = '<div class="empty-note">No grants yet — create one above.</div>';
+        return;
+      }
+      const rows = grants.map((g) => `
+        <tr>
+          <td>${g.label ? escapeHtml(g.label) : '<span style="color:var(--color-text-faint)">—</span>'}</td>
+          <td class="mono">${g.code}</td>
+          <td>${fmtDate(g.createdAt)}</td>
+          <td>${statusBadge(g.status)}</td>
+          <td>${g.status === 'pending' ? '—' : fmtDate(g.expiresAt)}</td>
+          <td>
+            ${g.status === 'pending'
+              ? `<button class="btn-ghost-admin" data-copy="${escapeHtml(location.origin + '/?redeem=' + g.code)}">Copy link</button>
+                 <button class="btn-danger-admin" data-delete="${g.code}">Delete</button>`
+              : g.status === 'active'
+                ? `<button class="btn-danger-admin" data-revoke="${g.code}">Revoke</button>`
+                : ''}
+          </td>
+        </tr>
+      `).join('');
+      wrap.innerHTML = `
+        <table>
+          <thead><tr><th>Label</th><th>Code</th><th>Created</th><th>Status</th><th>Expires</th><th></th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      `;
+      wrap.querySelectorAll('[data-copy]').forEach((b) =>
+        b.addEventListener('click', () => copyText(b.dataset.copy))
+      );
+      wrap.querySelectorAll('[data-revoke]').forEach((b) =>
+        b.addEventListener('click', () => revokeGrant(b.dataset.revoke))
+      );
+      wrap.querySelectorAll('[data-delete]').forEach((b) =>
+        b.addEventListener('click', () => deleteGrant(b.dataset.delete))
+      );
+    } catch (e) {
+      if (e.message !== 'unauthorized') {
+        wrap.innerHTML = `<div class="empty-note">Could not load grants — ${escapeHtml(e.message)}</div>`;
+      }
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  async function copyText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast('Link copied');
+    } catch (e) {
+      toast('Could not copy — select and copy manually');
+    }
+  }
+
+  async function revokeGrant(code) {
+    if (!confirm('Revoke this grant? The person will lose Premium access immediately.')) return;
+    try {
+      await adminFetch(`/api/admin/grants/${encodeURIComponent(code)}/revoke`, { method: 'POST' });
+      toast('Grant revoked');
+      loadGrants();
+    } catch (e) {
+      if (e.message !== 'unauthorized') toast(e.message || 'Could not revoke grant');
+    }
+  }
+
+  async function deleteGrant(code) {
+    if (!confirm('Delete this unredeemed code?')) return;
+    try {
+      await adminFetch(`/api/admin/grants/${encodeURIComponent(code)}`, { method: 'DELETE' });
+      toast('Code deleted');
+      loadGrants();
+    } catch (e) {
+      if (e.message !== 'unauthorized') toast(e.message || 'Could not delete code');
+    }
+  }
+
+  unlockBtn.addEventListener('click', async () => {
+    const key = adminKeyInput.value.trim();
+    if (!key) return;
+    adminKey = key;
+    gateErr.classList.remove('is-visible');
+    try {
+      await adminFetch('/api/admin/grants');
+      showMain();
+    } catch (e) {
+      if (e.message === 'unauthorized') {
+        gateErr.textContent = 'Incorrect key — check the server log or admin_key.txt.';
+        gateErr.classList.add('is-visible');
+      }
+    }
+  });
+  adminKeyInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') unlockBtn.click(); });
+
+  document.getElementById('createGrantBtn').addEventListener('click', async () => {
+    const label = document.getElementById('grantLabel').value.trim() || null;
+    const days = parseInt(document.getElementById('grantDays').value, 10) || 365;
+    const errEl = document.getElementById('createErr');
+    const resultBox = document.getElementById('resultBox');
+    errEl.classList.remove('is-visible');
+    resultBox.classList.remove('is-visible');
+    try {
+      const data = await adminFetch('/api/admin/grants', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label, duration_days: days }),
+      });
+      const link = `${location.origin}/?redeem=${data.code}`;
+      document.getElementById('resultLink').textContent = link;
+      resultBox.classList.add('is-visible');
+      document.getElementById('copyLinkBtn').onclick = () => copyText(link);
+      document.getElementById('grantLabel').value = '';
+      loadGrants();
+    } catch (e) {
+      if (e.message !== 'unauthorized') {
+        errEl.textContent = e.message || 'Could not create grant';
+        errEl.classList.add('is-visible');
+      }
+    }
+  });
+
+  showGate();
+})();
+</script>
+
+</body>
+</html>
