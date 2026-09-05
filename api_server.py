@@ -10,8 +10,12 @@ Both env vars are injected by start_server(api_credentials=["custom-cred:api.str
 
 Comp (complimentary) premium grants let the owner give specific people free access without
 going through Stripe at all — see the /api/admin/grants* and /api/redeem endpoints below. Admin
-endpoints are gated by a random key persisted in admin_key.txt (created on first boot, never
-checked into git, never shipped in the static dist/public bundle).
+endpoints are gated by a key read from the ADMIN_KEY env var (set in the Render dashboard, so it
+survives every redeploy). If ADMIN_KEY isn't set (e.g. local dev), a random key is generated and
+persisted in admin_key.txt instead — fine locally, but on Render that file lives on the
+no-persistent-disk filesystem and gets regenerated (rotated) on every redeploy, which is exactly
+why the env var is the real, intended path in production. Never checked into git, never shipped
+in the static dist/public bundle.
 
 Persistence: all app data lives in Supabase (Postgres) instead of a local SQLite file, so it
 survives independently of this sandbox — see SUPABASE_URL/SUPABASE_ANON_KEY below. The anon key
@@ -86,6 +90,19 @@ http_client: httpx.AsyncClient | None = None
 
 
 def _load_or_create_admin_key() -> str:
+    # Preferred path: an ADMIN_KEY env var, set once in the Render dashboard/API. Render
+    # env vars persist across every redeploy (unlike this service's filesystem, which has
+    # no attached persistent disk and is recreated from scratch on each deploy) — so this
+    # is what makes the admin key survive redeploys instead of rotating every time. Falls
+    # through to the file-based generator below only when the env var isn't set (e.g. local
+    # dev, where a throwaway per-boot key is fine and simpler than requiring a .env entry).
+    env_key = os.environ.get("ADMIN_KEY", "").strip()
+    if env_key:
+        return env_key
+    return _load_or_create_admin_key_from_file()
+
+
+def _load_or_create_admin_key_from_file() -> str:
     # Persisted across backend restarts (this file lives next to this script, outside the
     # static dist/public bundle that gets served publicly — see .gitignore).
     #
@@ -134,6 +151,8 @@ def _load_or_create_admin_key() -> str:
 
 
 ADMIN_KEY = _load_or_create_admin_key()
+_admin_key_source = "ADMIN_KEY env var (persists across redeploys)" if os.environ.get("ADMIN_KEY", "").strip() else "generated admin_key.txt (will rotate on next redeploy — set ADMIN_KEY env var to persist it)"
+print(f"[escout] Admin key source: {_admin_key_source}", flush=True)
 print(f"[escout] Admin key (for /admin.html — keep private): {ADMIN_KEY}", flush=True)
 
 
