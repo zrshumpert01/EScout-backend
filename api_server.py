@@ -88,19 +88,49 @@ http_client: httpx.AsyncClient | None = None
 def _load_or_create_admin_key() -> str:
     # Persisted across backend restarts (this file lives next to this script, outside the
     # static dist/public bundle that gets served publicly — see .gitignore).
+    #
+    # Runs under multiple uvicorn worker processes (--workers 2), each executing this module
+    # top-level at boot independently. A plain "check exists, then write" (the previous
+    # version of this function) has a real race window between the check and the write: two
+    # workers starting within microseconds of each other can both see the file missing, both
+    # generate their OWN random key, and both write it — whichever wrote last silently wins
+    # on disk, but the OTHER worker already has the earlier key loaded into its own process
+    # memory (ADMIN_KEY is read once at import time) and keeps using it for every request it
+    # handles for the rest of its life. Since requests get load-balanced across workers, this
+    # produced two simultaneously "valid-looking" admin keys, with roughly half of real admin
+    # calls failing with 401 depending on which worker happened to pick them up — confirmed
+    # directly against production logs after a fresh deploy, which printed two different keys
+    # a few milliseconds apart.
+    #
+    # Fix: use O_CREAT|O_EXCL, which atomically fails with FileExistsError if another process
+    # already created the file first (the file-creation equivalent of a compare-and-swap) —
+    # so only ONE worker's generated key ever actually gets persisted, and every other worker
+    # falls into the except branch and reads that same winning key back off disk instead of
+    # keeping the one it generated.
     if os.path.exists(ADMIN_KEY_PATH):
         with open(ADMIN_KEY_PATH, "r") as f:
             key = f.read().strip()
             if key:
                 return key
     key = secrets.token_urlsafe(24)
-    with open(ADMIN_KEY_PATH, "w") as f:
-        f.write(key)
     try:
-        os.chmod(ADMIN_KEY_PATH, 0o600)
-    except OSError:
-        pass
-    return key
+        fd = os.open(ADMIN_KEY_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(key)
+        return key
+    except FileExistsError:
+        # Another worker won the race and created the file a moment before we did — use its
+        # key instead of the one we generated, so every worker converges on one shared value.
+        # The winner's write (open+write+close, a single small write() call) can in principle
+        # still be mid-flight the instant we open for read, so retry briefly on an empty read
+        # rather than trusting a single read to always see the fully-written content.
+        for _ in range(10):
+            with open(ADMIN_KEY_PATH, "r") as f:
+                existing = f.read().strip()
+            if existing:
+                return existing
+            time.sleep(0.05)
+        raise RuntimeError(f"admin_key.txt exists but stayed empty at {ADMIN_KEY_PATH}")
 
 
 ADMIN_KEY = _load_or_create_admin_key()
