@@ -27,6 +27,7 @@ import asyncio
 import collections
 import hashlib
 import hmac
+import io
 import json
 import os
 import secrets
@@ -35,9 +36,10 @@ import uuid
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from PIL import Image, ImageChops, ImageDraw
 from pydantic import BaseModel, Field
 from supabase import AsyncClient, create_async_client
 
@@ -942,6 +944,196 @@ async def save_view_state(body: ViewStateBody, request: Request):
         on_conflict="visitor_id",
     ).execute()
     return {"saved": True}
+
+
+# ---- Public-land tile proxy: PAD-US primary + DOE NETL fallback ----------------------
+#
+# The frontend used to hit edits.nationalmap.gov directly from the browser for the
+# public/protected-land highlight overlay. That host has had real outages (confirmed live:
+# a 503 "Service Unavailable" while investigating a user report of the overlay vanishing),
+# and a browser-side raster source has no way to retry a different backend when its one
+# configured tile URL starts failing -- MapLibre just silently drops the tile, which reads
+# to the user as "no public land here" instead of "the data source is down". Routing tile
+# requests through this backend instead lets us try the primary service first and, only on
+# failure, fall back to a second live data source so the layer degrades gracefully instead
+# of going blank during an outage.
+#
+# Primary: PAD-US 4.1 Landforms MapServer (edits.nationalmap.gov) -- unchanged from the
+# existing client-side URL (same layer, same layerDefs/dynamicLayers/style), just proxied
+# through here so a failure can be caught server-side instead of silently eaten by the
+# browser. On success this is a byte-for-byte passthrough of the same PNG the browser used
+# to fetch directly.
+#
+# Fallback: DOE NETL's hosted mirror of the same PAD-US dataset (arcgis.netl.doe.gov),
+# confirmed live and responsive when the primary was down. It's a FeatureServer (vector
+# query only, no /export image endpoint) with a different field schema that's missing the
+# Pub_Access field the primary's access filter relies on -- so this route queries it and
+# rasterizes the result itself, approximating the same "exclude closed/private-easement
+# clutter" filter using the fields it does have: `category` (Fee/Designation/Easement/
+# Proclamation). Excluding Easement approximates excluding Pub_Access='XA' (verified
+# separately: MS's Pub_Access='XA' records are overwhelmingly private conservation
+# easements), and excluding Proclamation matches the primary's own existing filter (removes
+# the oversized "authorized acquisition boundary" outline around refuges/forests). This is a
+# deliberate approximation, not as precise as the primary's real Pub_Access field, and only
+# ever used while the primary is down.
+PADUS_PRIMARY_TILE_SERVICE = "https://edits.nationalmap.gov/arcgis/rest/services/PAD-US/PAD_US_Landforms/MapServer/export"
+PADUS_PRIMARY_LAYER_DEFS = json.dumps({0: "Pub_Access <> 'XA' AND Category <> 'Proclamation'"})
+PADUS_PRIMARY_DYNAMIC_LAYERS = json.dumps([{
+    "id": 0,
+    "source": {"type": "mapLayer", "mapLayerId": 0},
+    "drawingInfo": {
+        "showLabels": False,
+        "renderer": {
+            "type": "simple",
+            "symbol": {
+                "type": "esriSFS",
+                "style": "esriSFSSolid",
+                "color": [57, 255, 20, 10],
+                "outline": {"type": "esriSLS", "style": "esriSLSSolid", "color": [57, 255, 20, 210], "width": 0.75},
+            },
+        },
+    },
+}])
+
+NETL_FALLBACK_QUERY_URL = (
+    "https://arcgis.netl.doe.gov/server/rest/services/Hosted/"
+    "Protected_Areas_Database_for_the_United_States_PADUS/FeatureServer/32/query"
+)
+NETL_FALLBACK_WHERE = "category NOT IN ('Proclamation', 'Easement')"
+PADUS_FILL_RGBA = (57, 255, 20, 10)
+PADUS_OUTLINE_RGBA = (57, 255, 20, 210)
+TILE_SIZE = 256
+_TRANSPARENT_TILE = None  # lazily built once, see _blank_tile()
+
+
+def _blank_tile() -> bytes:
+    global _TRANSPARENT_TILE
+    if _TRANSPARENT_TILE is None:
+        buf = io.BytesIO()
+        Image.new("RGBA", (TILE_SIZE, TILE_SIZE), (0, 0, 0, 0)).save(buf, format="PNG")
+        _TRANSPARENT_TILE = buf.getvalue()
+    return _TRANSPARENT_TILE
+
+
+def _parse_bbox(bbox: str) -> tuple[float, float, float, float]:
+    parts = [float(p) for p in bbox.split(",")]
+    if len(parts) != 4:
+        raise ValueError(f"bbox must have 4 comma-separated values, got {bbox!r}")
+    xmin, ymin, xmax, ymax = parts
+    return xmin, ymin, xmax, ymax
+
+
+def _rasterize_netl_features(features: list[dict], bbox: tuple[float, float, float, float]) -> bytes:
+    """Render Esri-JSON polygon features (already in the tile's EPSG:3857 bbox/size) into a
+    transparent 256x256 PNG matching the primary source's fill+outline style. Supersamples at
+    4x and downsamples with antialiasing, since Pillow's native polygon drawing has no
+    anti-aliasing and the primary source's thin (0.75px) outline would otherwise look jagged.
+    Even-odd (XOR) ring compositing per feature so donut-shaped polygons (e.g. a refuge
+    boundary with private inholdings) render their holes correctly regardless of ring winding
+    order, which Esri JSON doesn't reliably encode.
+    """
+    xmin, ymin, xmax, ymax = bbox
+    scale = 4
+    dim = TILE_SIZE * scale
+    span_x = xmax - xmin
+    span_y = ymax - ymin
+
+    def to_px(pt: list[float]) -> tuple[float, float]:
+        x, y = pt[0], pt[1]
+        px = (x - xmin) / span_x * dim if span_x else 0.0
+        py = (ymax - y) / span_y * dim if span_y else 0.0  # flip: map y-up vs image y-down
+        return px, py
+
+    fill_layer = Image.new("RGBA", (dim, dim), (0, 0, 0, 0))
+    outline_layer = Image.new("RGBA", (dim, dim), (0, 0, 0, 0))
+    outline_draw = ImageDraw.Draw(outline_layer)
+    outline_width = max(1, round(0.75 * scale))
+
+    for feat in features:
+        rings = (feat.get("geometry") or {}).get("rings") or []
+        if not rings:
+            continue
+        feature_mask = Image.new("1", (dim, dim), 0)
+        for ring in rings:
+            if len(ring) < 3:
+                continue
+            pts = [to_px(pt) for pt in ring]
+            ring_mask = Image.new("1", (dim, dim), 0)
+            ImageDraw.Draw(ring_mask).polygon(pts, fill=1)
+            feature_mask = ImageChops.logical_xor(feature_mask, ring_mask)
+            outline_draw.line(pts + [pts[0]], fill=PADUS_OUTLINE_RGBA, width=outline_width)
+        fill_solid = Image.new("RGBA", (dim, dim), PADUS_FILL_RGBA)
+        fill_layer = Image.composite(fill_solid, fill_layer, feature_mask)
+
+    composited = Image.alpha_composite(fill_layer, outline_layer)
+    composited = composited.resize((TILE_SIZE, TILE_SIZE), Image.LANCZOS)
+    buf = io.BytesIO()
+    composited.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+@app.get("/api/tiles/public-land")
+async def public_land_tile(bbox: str):
+    """Proxies the PAD-US public-land highlight tile: tries the primary MapServer /export
+    first (byte-for-byte passthrough on success), falls back to querying+rasterizing the DOE
+    NETL mirror only if the primary errors or times out. Always returns a 200 PNG (falling
+    back to a blank transparent tile if BOTH sources fail) so a data-source outage degrades
+    to "no highlight this tile" instead of surfacing as a broken image/console error --
+    consistent with how a tile with genuinely no public land nearby already renders.
+    """
+    try:
+        parsed_bbox = _parse_bbox(bbox)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid bbox")
+
+    primary_params = {
+        "bbox": bbox,
+        "bboxSR": 3857,
+        "imageSR": 3857,
+        "size": f"{TILE_SIZE},{TILE_SIZE}",
+        "format": "png32",
+        "transparent": "true",
+        "layers": "show:0",
+        "layerDefs": PADUS_PRIMARY_LAYER_DEFS,
+        "dynamicLayers": PADUS_PRIMARY_DYNAMIC_LAYERS,
+        "f": "image",
+    }
+    try:
+        resp = await http_client.get(
+            PADUS_PRIMARY_TILE_SERVICE, params=primary_params, timeout=httpx.Timeout(6.0)
+        )
+        content_type = resp.headers.get("content-type", "")
+        if resp.status_code == 200 and content_type.startswith("image/"):
+            return Response(content=resp.content, media_type=content_type, headers={"X-Tile-Source": "padus-primary"})
+    except (httpx.TimeoutException, httpx.HTTPError):
+        pass  # fall through to NETL fallback below
+
+    xmin, ymin, xmax, ymax = parsed_bbox
+    query_params = {
+        "geometry": f"{xmin},{ymin},{xmax},{ymax}",
+        "geometryType": "esriGeometryEnvelope",
+        "inSR": 3857,
+        "outSR": 3857,
+        "spatialRel": "esriSpatialRelIntersects",
+        "where": NETL_FALLBACK_WHERE,
+        "outFields": "category,own_type",
+        "returnGeometry": "true",
+        "geometryPrecision": 2,
+        "f": "json",
+    }
+    try:
+        resp = await http_client.get(NETL_FALLBACK_QUERY_URL, params=query_params, timeout=httpx.Timeout(8.0))
+        resp.raise_for_status()
+        data = resp.json()
+        features = data.get("features") or []
+        if not features:
+            return Response(content=_blank_tile(), media_type="image/png", headers={"X-Tile-Source": "none-empty"})
+        tile_bytes = _rasterize_netl_features(features, parsed_bbox)
+        return Response(content=tile_bytes, media_type="image/png", headers={"X-Tile-Source": "netl-fallback"})
+    except Exception:
+        # Both sources failed -- degrade to a blank tile rather than a broken image or a
+        # 500 that would surface as a map error to the user.
+        return Response(content=_blank_tile(), media_type="image/png", headers={"X-Tile-Source": "none-error"})
 
 
 if __name__ == "__main__":
