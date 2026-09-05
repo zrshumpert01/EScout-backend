@@ -33,6 +33,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from supabase import AsyncClient, create_async_client
 
@@ -201,6 +202,79 @@ async def ensure_visitor_id(request: Request, call_next):
         httponly=True,
     )
     return response
+
+
+# ---------------------------------------------------------------------------
+# Dynamic per-visitor Web App Manifest
+# ---------------------------------------------------------------------------
+# Why this exists: localStorage is the frontend's normal home for the visitor
+# id, but an installed PWA's storage can be wiped (a browser "clear site
+# data" action, certain OS storage-pressure evictions, etc.) independently of
+# the home-screen icon itself -- and when that happened before, the frontend
+# silently minted a brand-new id, orphaning the visitor's real subscription
+# and waypoints server-side with no way back.
+#
+# Both iOS and Android permanently capture a PWA's manifest `start_url` at
+# "Add to Home Screen" / install time and re-navigate to that *exact* URL on
+# every subsequent launch from the home-screen icon, regardless of what
+# happens to that origin's storage in between. So instead of relying on
+# localStorage alone, the frontend (see repointManifestLink() in app.js)
+# always points its <link rel="manifest"> at this endpoint, which bakes the
+# already-resolved vid into the returned start_url. Any *future* install then
+# carries that vid permanently -- a channel a storage wipe can't touch.
+#
+# start_url/scope/icons must be emitted as *absolute* URLs pointing at the
+# real frontend origin (never this backend's own onrender.com origin) --
+# manifest URLs are otherwise resolved relative to the manifest's own URL,
+# which would silently break every icon and try to "launch" the installed
+# app at a URL on this API host instead of the actual site.
+_MANIFEST_ALLOWED_ORIGINS = {
+    "https://escout.pplx.app",
+    "https://escouthunt.com",
+    "https://www.escouthunt.com",
+    "http://localhost:3000",
+    "http://localhost:8765",
+}
+
+_MANIFEST_ICONS = [
+    {"src": "assets/icons/icon-192.png?v=26f7426b", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+    {"src": "assets/icons/icon-512.png?v=26f7426b", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+    {"src": "assets/icons/icon-maskable-512.png?v=26f7426b", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+]
+
+
+@app.get("/manifest.json")
+async def dynamic_manifest(request: Request):
+    vid = request.state.vid
+    # Never trust an arbitrary client-supplied origin string into a response
+    # that drives navigation/where icons load from -- only ever echo a value
+    # that matched our allow-list exactly. Falls back to a relative,
+    # vid-less manifest (identical in shape to the static manifest.json) if
+    # the origin is missing or unrecognized, so nothing breaks -- it just
+    # won't carry the vid into a future install from that origin.
+    origin = request.query_params.get("origin", "")
+    base = origin.rstrip("/") if origin in _MANIFEST_ALLOWED_ORIGINS else ""
+    manifest = {
+        "name": "EScout — AI Whitetail Scouting & Hunting Maps",
+        "short_name": "EScout",
+        "description": (
+            "AI terrain engine that finds likely whitetail bedding areas, travel "
+            "corridors, and stand sites from real public land-cover, elevation, "
+            "and weather data."
+        ),
+        "start_url": f"{base}/?vid={vid}" if base else f"./index.html?vid={vid}",
+        "scope": f"{base}/" if base else "./",
+        "display": "standalone",
+        "orientation": "portrait-primary",
+        "background_color": "#14120e",
+        "theme_color": "#14120e",
+        "categories": ["sports", "navigation", "utilities"],
+        "icons": [
+            {**icon, "src": f"{base}/{icon['src']}" if base else f"./{icon['src']}"}
+            for icon in _MANIFEST_ICONS
+        ],
+    }
+    return JSONResponse(manifest, media_type="application/manifest+json")
 
 
 SUBSCRIPTION_COLUMNS = (
