@@ -205,10 +205,24 @@
   // tint with a crisp boundary line, not a heavy block of color hiding the terrain/imagery
   // underneath it — the outline stays close to fully opaque so the boundary itself is still
   // easy to spot even though the fill is barely-there.
+  // Access/category filter: excludes Pub_Access='XA' (closed/no public access -- verified
+  // live against the service that this is overwhelmingly DOD installations and private
+  // conservation easements, e.g. Camp Shelby, which otherwise renders as a ~138,000-acre
+  // solid-green "public" block) and Category='Proclamation' (oversized "authorized
+  // acquisition boundary" outlines around refuges/forests that aren't themselves open
+  // ground). Embedded as this layer's own `definitionExpression` -- NOT the top-level
+  // `layerDefs` request parameter, which Esri's Export Map operation silently ignores
+  // whenever `dynamicLayers` is also present (verified live: identical output with and
+  // without layerDefs). Must use `NOT IN (...)` rather than `<> ... AND ... <> ...`: the
+  // nationalmap.gov WAF returns a hard 404 for two quoted `<>` comparisons joined by
+  // AND/OR in the same expression (verified live), which is exactly why the previous
+  // attempt at this same filter had no effect on the live map.
   const PADUS_DYNAMIC_LAYERS = encodeURIComponent(JSON.stringify([{
     id: 0,
     source: { type: 'mapLayer', mapLayerId: 0 },
+    definitionExpression: "Category NOT IN ('Proclamation') AND Pub_Access NOT IN ('XA')",
     drawingInfo: {
+      showLabels: false,
       renderer: {
         type: 'simple',
         symbol: {
