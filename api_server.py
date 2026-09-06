@@ -995,6 +995,33 @@ PADUS_PRIMARY_DYNAMIC_LAYERS = json.dumps([{
     },
 }])
 
+# USACE's own real-estate system of record (REMIS "Civil Works Land Data Migration"), layer 5
+# ("Site") -- the authoritative per-project Corps boundary, kept in sync with the mirrored
+# constants in app.js (USACE_CWLDM_*). Proxied here for the same reason as the PAD-US route
+# above, but for a different root cause: geospatial.sec.usace.army.mil only sends
+# Access-Control-Allow-Origin for requests whose Origin header is itself a *.usace.army.mil
+# domain (confirmed live by sending different Origin headers and comparing responses) --
+# escouthunt.com/escout.pplx.app can never be on that allow-list, so the browser permanently
+# blocks this tile as a CORS failure regardless of whether the USACE server itself is up. A
+# server-to-server request from this backend isn't subject to browser CORS at all, so simply
+# proxying it here fixes the layer with no change to USACE's own access policy required.
+USACE_CWLDM_TILE_SERVICE = "https://geospatial.sec.usace.army.mil/server/rest/services/REMIS/cwldm/MapServer/export"
+USACE_CWLDM_DYNAMIC_LAYERS = json.dumps([{
+    "id": 5,
+    "source": {"type": "mapLayer", "mapLayerId": 5},
+    "drawingInfo": {
+        "renderer": {
+            "type": "simple",
+            "symbol": {
+                "type": "esriSFS",
+                "style": "esriSFSSolid",
+                "color": [57, 255, 20, 10],
+                "outline": {"type": "esriSLS", "style": "esriSLSSolid", "color": [57, 255, 20, 210], "width": 0.75},
+            },
+        },
+    },
+}])
+
 NETL_FALLBACK_QUERY_URL = (
     "https://arcgis.netl.doe.gov/server/rest/services/Hosted/"
     "Protected_Areas_Database_for_the_United_States_PADUS/FeatureServer/32/query"
@@ -1134,6 +1161,44 @@ async def public_land_tile(bbox: str):
         # Both sources failed -- degrade to a blank tile rather than a broken image or a
         # 500 that would surface as a map error to the user.
         return Response(content=_blank_tile(), media_type="image/png", headers={"X-Tile-Source": "none-error"})
+
+
+@app.get("/api/tiles/usace-land")
+async def usace_land_tile(bbox: str):
+    """Proxies the USACE REMIS (Civil Works Land Data Migration) layer-5 tile. This is a
+    straight passthrough, not a fallback like public_land_tile above -- there's only one
+    upstream source here, and it isn't down, it's a browser CORS restriction: USACE only
+    sends Access-Control-Allow-Origin for requests whose Origin is itself a *.usace.army.mil
+    domain, which this app's origin can never be. A server-to-server request from this
+    backend has no Origin-based restriction, so proxying it here is the whole fix. Always
+    returns a 200 PNG -- a blank transparent tile on any upstream failure -- for the same
+    reason as public_land_tile: an outage should look like "no boundary here", not a broken
+    tile or console error.
+    """
+    try:
+        _parse_bbox(bbox)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid bbox")
+
+    params = {
+        "bbox": bbox,
+        "bboxSR": 3857,
+        "imageSR": 3857,
+        "size": f"{TILE_SIZE},{TILE_SIZE}",
+        "format": "png32",
+        "transparent": "true",
+        "layers": "show:5",
+        "dynamicLayers": USACE_CWLDM_DYNAMIC_LAYERS,
+        "f": "image",
+    }
+    try:
+        resp = await http_client.get(USACE_CWLDM_TILE_SERVICE, params=params, timeout=httpx.Timeout(8.0))
+        content_type = resp.headers.get("content-type", "")
+        if resp.status_code == 200 and content_type.startswith("image/"):
+            return Response(content=resp.content, media_type=content_type, headers={"X-Tile-Source": "usace-direct"})
+    except (httpx.TimeoutException, httpx.HTTPError):
+        pass
+    return Response(content=_blank_tile(), media_type="image/png", headers={"X-Tile-Source": "none-error"})
 
 
 if __name__ == "__main__":
