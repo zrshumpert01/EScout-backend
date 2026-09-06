@@ -1939,26 +1939,25 @@
   const isCoverCat = (cat) => cat === 'forest' || cat === 'shrub' || cat === 'wetland';
   const isFieldCat = (cat) => cat === 'pasture' || cat === 'crop';
 
+  // Routed through our own backend (escout-backend.onrender.com/api/scout/landcover) instead
+  // of calling the USDA NLCD service (geo.fas.usda.gov) directly from the browser. Reason:
+  // confirmed live on 2026-09-06 that geo.fas.usda.gov was completely unreachable (TLS
+  // handshake failures on every request), which silently turned every Scout AI scan into
+  // "no forest/shrub/wetland cover found" instead of a visible error, since every per-cell
+  // fetch failure here was swallowed by sampleGrid's .catch(() => null). The backend route
+  // tries this exact same USDA service first (identical classification codes on success) and
+  // falls back to a second live NLCD source (MRLC's public WMS) if the primary errors, so an
+  // outage degrades to a slower lookup instead of a wrongly-empty scan. It also collapses what
+  // used to be up to 64 simultaneous direct-to-government-server requests per scan into 64
+  // requests against our own backend instead, which is far less likely to get rate-limited or
+  // blocked than a browser hammering a federal ArcGIS server directly.
   async function fetchLandCoverAt(lng, lat) {
-    const ext = 0.01;
-    const usp = new URLSearchParams({
-      geometry: `${lng},${lat}`,
-      geometryType: 'esriGeometryPoint',
-      sr: '4326',
-      tolerance: '1',
-      mapExtent: `${lng - ext},${lat - ext},${lng + ext},${lat + ext}`,
-      imageDisplay: '2,2,96',
-      returnGeometry: 'false',
-      f: 'json',
-    });
-    const res = await fetch(`${NLCD_SERVICE}/identify?${usp.toString()}`);
-    if (!res.ok) throw new Error('NLCD service error ' + res.status);
+    const usp = new URLSearchParams({ lng, lat });
+    const res = await fetch(`${API}/api/scout/landcover?${usp.toString()}`);
+    if (!res.ok) throw new Error('Land cover service error ' + res.status);
     const data = await res.json();
-    const attrs = data.results && data.results[0] && data.results[0].attributes;
-    if (!attrs) return null;
-    const code = parseInt(attrs['Raster.Value'], 10);
-    if (Number.isNaN(code)) return null;
-    return { code, label: attrs['Raster.NLCD Land Cover Class'] || LC_LABELS[code] || 'Unclassified' };
+    if (data.code == null || Number.isNaN(data.code)) return null;
+    return { code: data.code, label: LC_LABELS[data.code] || 'Unclassified' };
   }
   async function fetchElevationAt(lng, lat) {
     const usp = new URLSearchParams({ x: lng, y: lat, units: 'Feet', wkid: '4326', includeDate: 'false' });
@@ -2178,15 +2177,23 @@
         cells.push({ r, c, lng, lat, inParcel: ring ? pointInRing([lng, lat], ring) : true });
       }
     }
+    // Promise.allSettled (not .catch(() => null) on both) so a genuine fetch failure --
+    // the land-cover service being unreachable -- is distinguishable from the service
+    // responding successfully with "no classified pixel here" (a real, valid no-data
+    // result, e.g. open water gaps or tile edges). Both used to collapse into the same
+    // 'unknown' category, which is why a data-source outage looked identical to "there's
+    // genuinely no forest/shrub/wetland in this view" instead of surfacing as an error.
     await Promise.all(
       cells.map(async (cell) => {
-        const [lc, elev] = await Promise.all([
-          fetchLandCoverAt(cell.lng, cell.lat).catch(() => null),
-          fetchElevationAt(cell.lng, cell.lat).catch(() => null),
+        const [lcSettled, elevSettled] = await Promise.allSettled([
+          fetchLandCoverAt(cell.lng, cell.lat),
+          fetchElevationAt(cell.lng, cell.lat),
         ]);
+        const lc = lcSettled.status === 'fulfilled' ? lcSettled.value : null;
+        const elev = elevSettled.status === 'fulfilled' ? elevSettled.value : null;
         cell.code = lc ? lc.code : null;
         cell.label = lc ? lc.label : 'No data';
-        cell.category = lc ? lcCategory(lc.code) : 'unknown';
+        cell.category = lc ? lcCategory(lc.code) : (lcSettled.status === 'rejected' ? 'error' : 'unknown');
         cell.elev = elev;
       })
     );
@@ -2549,9 +2556,16 @@
     const cells = await sampleGrid(bounds, ring);
     // hasField/hasCover only look at cells inside the selected parcel (or, with no
     // parcel selected, every cell is inParcel by default — same behavior as before).
-    const usable = cells.filter((c) => c.inParcel && c.category !== 'unknown');
+    const inScope = cells.filter((c) => c.inParcel);
+    const usable = inScope.filter((c) => c.category !== 'unknown' && c.category !== 'error');
     const hasField = cells.some((c) => c.inParcel && isFieldCat(c.category));
     const hasCover = cells.some((c) => c.inParcel && isCoverCat(c.category));
+    // If most sampled cells came back as real fetch failures (both the primary and fallback
+    // land-cover sources unreachable) rather than the service legitimately reporting no data,
+    // this is a provider outage, not an empty area — surface that distinction to the user
+    // instead of reporting "no cover found" on land that may well have cover.
+    const errored = inScope.filter((c) => c.category === 'error').length;
+    const providerDown = inScope.length > 0 && errored / inScope.length > 0.5;
     const results = [];
     const minSpacingYds = minPinSpacingYards(bounds);
     let corridorCandidates = [];
@@ -2567,7 +2581,7 @@
       const corridor = pickBestCorridor(corridorCandidates, biasSegment, avoidPts, minSpacingYds);
       if (corridor) results.push(corridor);
     }
-    return { cells, usableCount: usable.length, hasField, hasCover, results };
+    return { cells, usableCount: usable.length, hasField, hasCover, providerDown, results };
   }
 
   // Populated fresh at scan time from analyzeViewport() — this is the array everything else
@@ -2623,11 +2637,15 @@
     resultMarkers = [];
   }
 
+  // Live wind now loads first (see runScan below) so the actual scoring pass has a fresh
+  // reading to work with, instead of scoring against whatever wind was left over from the
+  // previous scan (or nothing at all on the very first scan of a session) and only fetching
+  // real wind afterward for display. Step order here follows that same real sequence now.
   const scanSteps = [
+    'Loading live wind — Open-Meteo…',
     'Pulling elevation & slope — USGS 3DEP…',
     'Reading forest & crop cover — NLCD…',
     'Checking creeks & wetlands in frame…',
-    'Loading live wind — Open-Meteo…',
     'Modeling deer movement — Scout AI engine…',
   ];
 
@@ -2730,12 +2748,17 @@
     const tick = () => new Promise((res) => setTimeout(res, minStepMs));
     try {
       advance(0);
-      const [analysis] = await Promise.all([analyzeViewport(bounds, seasonForScan, ringForScan), tick()]);
-      advance(1);
-      await tick();
-      advance(2);
-      const wind = await fetchLiveWind(centerForWind.lng, centerForWind.lat).catch(() => null);
+      // Wind is fetched and assigned to `liveWind` BEFORE analyzeViewport runs its scoring
+      // pass (buildFieldEdgeStand / buildBedding / pickBestCorridor all read the closured
+      // `liveWind` directly). Previously this happened in the opposite order, so every scan
+      // scored wind favorability using stale wind from the last scan — or nothing at all on
+      // the first scan of a session.
+      const [wind] = await Promise.all([fetchLiveWind(centerForWind.lng, centerForWind.lat).catch(() => null), tick()]);
       if (wind) liveWind = wind;
+      advance(1);
+      const [analysis] = await Promise.all([analyzeViewport(bounds, seasonForScan, ringForScan), tick()]);
+      advance(2);
+      await tick();
       advance(3);
       await tick();
       advance(4);
@@ -2747,6 +2770,8 @@
       dropResultMarkers();
       if (activeResults.length) {
         toast('Scout AI found ' + activeResults.length + ' likely spot' + (activeResults.length === 1 ? '' : 's') + ' from real terrain data on ' + scopeLabel);
+      } else if (analysis.providerDown) {
+        toast('Scout AI couldn’t reach the land-cover data source for ' + scopeLabel + ' — this area may still have cover, try scanning again in a moment');
       } else if (!analysis.hasCover) {
         toast('No forest, shrub, or wetland cover detected on ' + scopeLabel + (selectedParcel ? '' : ' — pan toward timber for a scout read'));
       } else {
