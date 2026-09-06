@@ -977,10 +977,19 @@ async def save_view_state(body: ViewStateBody, request: Request):
 # deliberate approximation, not as precise as the primary's real Pub_Access field, and only
 # ever used while the primary is down.
 PADUS_PRIMARY_TILE_SERVICE = "https://edits.nationalmap.gov/arcgis/rest/services/PAD-US/PAD_US_Landforms/MapServer/export"
-PADUS_PRIMARY_LAYER_DEFS = json.dumps({0: "Pub_Access <> 'XA' AND Category <> 'Proclamation'"})
+# The access/category filter has to be embedded as this layer's own `definitionExpression`
+# inside `dynamicLayers`, NOT sent as the top-level `layerDefs` request parameter -- verified
+# live that Esri's Export Map operation silently ignores `layerDefs` whenever `dynamicLayers`
+# is also present (identical byte-for-byte output with and without it), so the previous
+# version of this filter was dead code with zero effect on the live tiles. It also has to use
+# `NOT IN (...)` rather than `<> ... AND ... <> ...`: nationalmap.gov's WAF returns a hard 404
+# for two quoted `<>` comparisons joined by AND/OR in the same expression (verified live),
+# which is exactly why the earlier attempt at this same filter changed nothing. This mirrors
+# the fix applied to the client-side USGS_PADUS_TILES constant in app.js.
 PADUS_PRIMARY_DYNAMIC_LAYERS = json.dumps([{
     "id": 0,
     "source": {"type": "mapLayer", "mapLayerId": 0},
+    "definitionExpression": "Category NOT IN ('Proclamation') AND Pub_Access NOT IN ('XA')",
     "drawingInfo": {
         "showLabels": False,
         "renderer": {
@@ -1121,7 +1130,6 @@ async def public_land_tile(bbox: str):
         "format": "png32",
         "transparent": "true",
         "layers": "show:0",
-        "layerDefs": PADUS_PRIMARY_LAYER_DEFS,
         "dynamicLayers": PADUS_PRIMARY_DYNAMIC_LAYERS,
         "f": "image",
     }
