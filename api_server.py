@@ -1054,6 +1054,14 @@ PADUS_OUTLINE_RGBA = (57, 255, 20, 210)
 TILE_SIZE = 256
 _TRANSPARENT_TILE = None  # lazily built once, see _blank_tile()
 
+# Scout AI land-cover lookup. Primary is the same USDA NLCD ArcGIS MapServer the frontend
+# always called directly; fallback is MRLC's public WMS mirror of the same NLCD raster,
+# published by the same underlying USGS/MRLC consortium program but on different
+# infrastructure, so an outage of one is very unlikely to also take down the other.
+NLCD_PRIMARY_IDENTIFY = "https://geo.fas.usda.gov/arcgis2/rest/services/G_Land_Cover/NLCD/MapServer/identify"
+NLCD_FALLBACK_WMS = "https://www.mrlc.gov/geoserver/mrlc_display/wms"
+NLCD_FALLBACK_LAYER = "NLCD_2021_Land_Cover_L48"
+
 
 def _blank_tile() -> bytes:
     global _TRANSPARENT_TILE
@@ -1220,6 +1228,80 @@ async def usace_land_tile(bbox: str):
     except (httpx.TimeoutException, httpx.HTTPError):
         pass
     return Response(content=_blank_tile(), media_type="image/png", headers={"X-Tile-Source": "none-error"})
+
+
+@app.get("/api/scout/landcover")
+async def scout_landcover(lng: float, lat: float):
+    """Proxies Scout AI's per-cell land-cover lookup server-side, instead of the browser
+    calling the USDA NLCD ArcGIS MapServer directly up to 64 times per scan. Confirmed live
+    on 2026-09-06 that geo.fas.usda.gov was completely unreachable (TLS handshake failures on
+    every request, including the bare domain) -- and because the frontend wrapped each of
+    those per-cell calls in `.catch(() => null)`, the outage silently turned into "no forest,
+    shrub, or wetland cover found" for every scan instead of a visible error. This route tries
+    that same USDA service first (identical NLCD classification codes on success, so nothing
+    downstream has to change), then falls back to MRLC's public WMS mirror of the same NLCD
+    raster -- a different program/infrastructure, so it staying up when USDA's is down is a
+    real, independent path, not just a second call to the same backend. Returns
+    {"code": null} (200, not an error) when a source responds but genuinely has no classified
+    pixel at this point -- e.g. open water gaps or tile edges -- so the frontend's existing
+    null-handling still works. Only raises when BOTH sources are actually unreachable, so the
+    frontend can tell "no data here" apart from "data source is down" and stop reporting empty
+    scans when the real problem is an outage.
+    """
+    ext = 0.01
+    primary_params = {
+        "geometry": f"{lng},{lat}",
+        "geometryType": "esriGeometryPoint",
+        "sr": "4326",
+        "tolerance": "1",
+        "mapExtent": f"{lng - ext},{lat - ext},{lng + ext},{lat + ext}",
+        "imageDisplay": "2,2,96",
+        "returnGeometry": "false",
+        "f": "json",
+    }
+    try:
+        resp = await http_client.get(NLCD_PRIMARY_IDENTIFY, params=primary_params, timeout=httpx.Timeout(2.5))
+        if resp.status_code == 200:
+            data = resp.json()
+            results = data.get("results") or []
+            attrs = results[0].get("attributes") if results else None
+            if attrs is not None:
+                try:
+                    code = int(attrs.get("Raster.Value"))
+                except (TypeError, ValueError):
+                    code = None
+                return {"code": code, "source": "usda-primary"}
+    except (httpx.TimeoutException, httpx.HTTPError, ValueError, json.JSONDecodeError, KeyError, IndexError):
+        pass  # fall through to the MRLC fallback below
+
+    d = 0.0005
+    wms_params = {
+        "SERVICE": "WMS",
+        "VERSION": "1.1.1",
+        "REQUEST": "GetFeatureInfo",
+        "LAYERS": NLCD_FALLBACK_LAYER,
+        "QUERY_LAYERS": NLCD_FALLBACK_LAYER,
+        "BBOX": f"{lng - d},{lat - d},{lng + d},{lat + d}",
+        "WIDTH": 2,
+        "HEIGHT": 2,
+        "X": 1,
+        "Y": 1,
+        "SRS": "EPSG:4326",
+        "INFO_FORMAT": "application/json",
+    }
+    try:
+        resp = await http_client.get(NLCD_FALLBACK_WMS, params=wms_params, timeout=httpx.Timeout(6.0))
+        resp.raise_for_status()
+        data = resp.json()
+        features = data.get("features") or []
+        props = features[0].get("properties") if features else None
+        code = props.get("PALETTE_INDEX") if props else None
+        return {"code": code, "source": "mrlc-fallback"}
+    except Exception:
+        # Both the primary and fallback sources are unreachable -- a real outage. Raise
+        # instead of returning {"code": null} so the frontend can tell this apart from a
+        # source legitimately having no data at this point.
+        raise HTTPException(status_code=502, detail="land cover data unavailable")
 
 
 if __name__ == "__main__":
