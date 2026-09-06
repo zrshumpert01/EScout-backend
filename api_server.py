@@ -986,10 +986,23 @@ PADUS_PRIMARY_TILE_SERVICE = "https://edits.nationalmap.gov/arcgis/rest/services
 # for two quoted `<>` comparisons joined by AND/OR in the same expression (verified live),
 # which is exactly why the earlier attempt at this same filter changed nothing. This mirrors
 # the fix applied to the client-side USGS_PADUS_TILES constant in app.js.
+#
+# Also excludes Unit_Nm='Mississippi 16th Section Public School Trust Lands' -- a single
+# PAD-US record covering 646,000+ acres statewide, one square mile per township section,
+# which is exactly the uniform statewide grid of small squares users reported. PAD-US marks
+# it Pub_Access='OA' (open access) so the access/category filter above doesn't touch it, but
+# per the user's confirmation these sections are overwhelmingly leased out by the state to
+# private farming/timber/hunting interests and are not actually open to public hunting
+# access, so they're excluded here by name. (The DOE NETL fallback below can't apply this
+# same exclusion -- its schema has no per-unit name field -- so this specific clutter can
+# reappear only during a primary PAD-US outage.)
 PADUS_PRIMARY_DYNAMIC_LAYERS = json.dumps([{
     "id": 0,
     "source": {"type": "mapLayer", "mapLayerId": 0},
-    "definitionExpression": "Category NOT IN ('Proclamation') AND Pub_Access NOT IN ('XA')",
+    "definitionExpression": (
+        "Category NOT IN ('Proclamation') AND Pub_Access NOT IN ('XA') "
+        "AND Unit_Nm NOT IN ('Mississippi 16th Section Public School Trust Lands')"
+    ),
     "drawingInfo": {
         "showLabels": False,
         "renderer": {
