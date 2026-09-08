@@ -743,22 +743,66 @@ class RestoreBody(BaseModel):
     email: str
 
 
-@app.post("/api/restore")
-async def restore_subscription(body: RestoreBody, request: Request):
-    # Recovers a paid subscription onto whichever storage context is currently running, by
-    # looking it up in Stripe via the email used at checkout instead of the anonymous visitor
-    # id. This exists because iOS gives every separate "Add to Home Screen" install of the same
-    # URL its own isolated storage/visitor id (see the comment on redeemCode in app.js for the
-    # same limitation with comp codes) — someone who pays from one installed icon, or from
-    # Safari, and then opens a *different* icon/browser sees "Free" there even though the
-    # payment succeeded, because that context has never seen its own visitor id upgraded.
-    # Rate-limited fairly tightly since this takes an arbitrary email and probes Stripe.
-    await rate_limit(f"restore:{client_ip(request)}", limit=5, window_seconds=60)
-    vid = request.state.vid
-    email = (body.email or "").strip().lower()
-    if not email or "@" not in email or len(email) > 254:
-        raise HTTPException(400, "Enter a valid email address")
+class RestoreConfirmBody(BaseModel):
+    email: str
+    code: str
 
+
+RESTORE_CODE_TTL_SECONDS = 10 * 60  # 10 minutes
+RESTORE_MAX_CODE_ATTEMPTS = 5
+
+# Sender for verification-code emails, and the API key for the send itself. Same dual-path
+# pattern as Stripe above: production (Render) sets RESEND_API_KEY directly as a real secret
+# in the dashboard, so it survives redeploys and never touches git or dist/public. Sandbox/dev
+# fallback routes through the agent's custom-credentials proxy instead, which injects
+# CUSTOM_CRED_API_RESEND_COM_URL/TOKEN when start_server(api_credentials=[...]) is used —
+# without this fallback, a sandbox test would need the real key sitting in this process's env.
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+if RESEND_API_KEY:
+    RESEND_BASE = "https://api.resend.com"
+    RESEND_KEY_HEADER = {"Authorization": f"Bearer {RESEND_API_KEY}"}
+else:
+    RESEND_BASE = os.environ.get("CUSTOM_CRED_API_RESEND_COM_URL", "").rstrip("/")
+    RESEND_KEY_HEADER = {"x-api-key": os.environ.get("CUSTOM_CRED_API_RESEND_COM_TOKEN", "")}
+RESTORE_FROM_EMAIL = os.environ.get("RESTORE_FROM_EMAIL", "EScout <support@escouthunt.com>")
+
+
+def _hash_restore_code(email: str, code: str) -> str:
+    # Keyed with ADMIN_KEY (already a private, per-deploy secret) so a Supabase row alone
+    # can't be replayed or brute-forced offline without also knowing that server secret.
+    msg = f"{email}:{code}".encode()
+    return hmac.new(ADMIN_KEY.encode(), msg, hashlib.sha256).hexdigest()
+
+
+async def _send_restore_code_email(email: str, code: str) -> None:
+    if not RESEND_BASE:
+        raise HTTPException(500, "Email service isn't configured on the server yet")
+    resp = await http_client.post(
+        f"{RESEND_BASE}/emails",
+        headers=RESEND_KEY_HEADER,
+        json={
+            "from": RESTORE_FROM_EMAIL,
+            "to": [email],
+            "subject": f"{code} is your EScout verification code",
+            "text": (
+                f"Your EScout verification code is {code}.\n\n"
+                "Enter it in the app to restore Premium on this device. It expires in "
+                "10 minutes. If you didn't request this, you can ignore this email."
+            ),
+            "html": (
+                f"<p>Your EScout verification code is:</p>"
+                f"<p style='font-size:28px;font-weight:700;letter-spacing:4px'>{code}</p>"
+                "<p>Enter it in the app to restore Premium on this device. It expires in "
+                "10 minutes. If you didn't request this, you can ignore this email.</p>"
+            ),
+        },
+    )
+    if resp.status_code >= 400:
+        # Don't leak provider error detail (could include the recipient address) to the client.
+        raise HTTPException(502, "Couldn't send the verification email — please try again shortly")
+
+
+async def _find_active_subscription_by_email(email: str) -> tuple[str, dict] | None:
     escaped = email.replace("\\", "\\\\").replace("'", "\\'")
     search = await stripe_request("GET", "/v1/customers/search", params={"query": f"email:'{escaped}'"})
     customers = search.get("data") or []
@@ -767,12 +811,8 @@ async def restore_subscription(body: RestoreBody, request: Request):
         # an exact-match list lookup, which reads the primary store instead of the index.
         listed = await stripe_request("GET", "/v1/customers", params={"email": email, "limit": 10})
         customers = listed.get("data") or []
-
-    # Same generic 404 whether the email has no Stripe customer at all or has one with no
-    # active subscription — don't let this endpoint be used to probe which emails have paid.
-    not_found = HTTPException(404, "No active subscription found for that email")
     if not customers:
-        raise not_found
+        return None
 
     best_sub = None
     best_customer_id = None
@@ -786,9 +826,96 @@ async def restore_subscription(body: RestoreBody, request: Request):
             if best_sub is None or (sub.get("current_period_end") or 0) > (best_sub.get("current_period_end") or 0):
                 best_sub = sub
                 best_customer_id = cust["id"]
-
     if not best_sub:
-        raise not_found
+        return None
+    return best_customer_id, best_sub
+
+
+@app.post("/api/restore/request")
+async def restore_request(body: RestoreBody, request: Request):
+    # Step 1 of Restore Purchase: send a one-time code to the typed email before restoring
+    # anything. This closes the gap in the earlier single-step /api/restore endpoint, which
+    # trusted whatever email was typed with no proof the caller actually owned that inbox —
+    # anyone who knew a paying customer's address could have restored Premium onto their own
+    # device. Rate-limited per IP AND per email so neither a single caller nor a spread of
+    # requests targeting one address can spam a mailbox.
+    await rate_limit(f"restore_req_ip:{client_ip(request)}", limit=5, window_seconds=60)
+    vid = request.state.vid
+    email = (body.email or "").strip().lower()
+    if not email or "@" not in email or len(email) > 254:
+        raise HTTPException(400, "Enter a valid email address")
+    await rate_limit(f"restore_req_email:{email}", limit=3, window_seconds=600)
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    now = int(time.time())
+    await supabase.table("restore_codes").insert({
+        "email": email,
+        "code_hash": _hash_restore_code(email, code),
+        "vid": vid,
+        "attempts": 0,
+        "expires_at": now + RESTORE_CODE_TTL_SECONDS,
+        "created_at": now,
+    }).execute()
+    await _send_restore_code_email(email, code)
+    # Generic response regardless of whether this email actually has an active subscription —
+    # the code has to be entered correctly before /api/restore/confirm reveals anything.
+    return {"sent": True}
+
+
+@app.post("/api/restore/confirm")
+async def restore_confirm(body: RestoreConfirmBody, request: Request):
+    # Step 2: only after the caller proves they received the code at that inbox do we look the
+    # subscription up in Stripe and restore it onto this device's visitor id.
+    await rate_limit(f"restore_confirm:{client_ip(request)}", limit=10, window_seconds=60)
+    vid = request.state.vid
+    email = (body.email or "").strip().lower()
+    code = (body.code or "").strip()
+    if not email or "@" not in email:
+        raise HTTPException(400, "Enter a valid email address")
+    if not code:
+        raise HTTPException(400, "Enter the code from your email")
+
+    now = int(time.time())
+    res = (
+        await supabase.table("restore_codes")
+        .select("id,code_hash,vid,attempts,expires_at,used_at")
+        .eq("email", email)
+        .eq("vid", vid)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    rows = res.data
+    row = rows[0] if rows else None
+    invalid = HTTPException(400, "That code is invalid or has expired — request a new one")
+    if not row or row.get("used_at") or row["expires_at"] < now:
+        raise invalid
+    if row["attempts"] >= RESTORE_MAX_CODE_ATTEMPTS:
+        raise HTTPException(429, "Too many incorrect attempts — request a new code")
+
+    if not secrets.compare_digest(row["code_hash"], _hash_restore_code(email, code)):
+        await (
+            supabase.table("restore_codes")
+            .update({"attempts": row["attempts"] + 1})
+            .eq("id", row["id"])
+            .execute()
+        )
+        raise invalid
+
+    # Mark used immediately so the same code can't be replayed even if this request is retried.
+    await (
+        supabase.table("restore_codes")
+        .update({"used_at": now})
+        .eq("id", row["id"])
+        .execute()
+    )
+
+    found = await _find_active_subscription_by_email(email)
+    if not found:
+        # Safe to be specific now — the caller already proved they own this inbox, so this
+        # can't be used to probe which emails have paid.
+        raise HTTPException(404, "No active subscription found for that email")
+    best_customer_id, best_sub = found
 
     await upsert_row(
         vid,
