@@ -933,7 +933,10 @@ async def restore_confirm(body: RestoreConfirmBody, request: Request):
 
 # ------------------------------------------------------------------------------------------
 # Waypoints (dropped pins) — persisted per visitor, plus shareable links so a set of pins can
-# be copied onto another visitor's map without ever needing accounts or logins.
+# be shared onto another visitor's map without ever needing accounts or logins. Sharing is a
+# LIVE, view-only grant (see waypoint_share_grants below), not a copy: the recipient always
+# sees the owner's current row, the owner can revoke access any time, and the recipient can
+# never edit or delete the original.
 # ------------------------------------------------------------------------------------------
 
 
@@ -959,7 +962,7 @@ class ShareBody(BaseModel):
 WAYPOINT_COLUMNS = "id,visitor_id,type,lng,lat,label,note,confidence,created_at,shared_from"
 
 
-def _waypoint_dict(row: dict) -> dict:
+def _waypoint_dict(row: dict, view_only: bool = False) -> dict:
     return {
         "id": row["id"],
         "type": row["type"],
@@ -970,6 +973,7 @@ def _waypoint_dict(row: dict) -> dict:
         "confidence": row["confidence"],
         "createdAt": row["created_at"],
         "sharedFrom": row["shared_from"],
+        "viewOnly": view_only,
     }
 
 
@@ -1009,7 +1013,24 @@ async def list_waypoints(request: Request):
     res = await supabase.table("waypoints").select(WAYPOINT_COLUMNS).eq("visitor_id", vid).order(
         "created_at", desc=False
     ).execute()
-    return {"waypoints": [_waypoint_dict(r) for r in res.data]}
+    own = [_waypoint_dict(r) for r in res.data]
+
+    # Live shares: pins someone else owns and has actively shared with this visitor. These
+    # are never copied into this visitor's own `waypoints` rows — we re-fetch the owner's
+    # live row every time, so edits/deletes on the owner's side are reflected automatically,
+    # and the recipient can never edit or delete the original (view-only, enforced below and
+    # again server-side on every mutating endpoint by ownership checks).
+    grants_res = await supabase.table("waypoint_share_grants").select("waypoint_id").eq(
+        "recipient_vid", vid
+    ).is_("revoked_at", "null").execute()
+    shared_ids = [g["waypoint_id"] for g in grants_res.data]
+    shared = []
+    if shared_ids:
+        shared_res = await supabase.table("waypoints").select(WAYPOINT_COLUMNS).in_(
+            "id", shared_ids
+        ).execute()
+        shared = [_waypoint_dict(r, view_only=True) for r in shared_res.data]
+    return {"waypoints": own + shared}
 
 
 @app.post("/api/waypoints")
@@ -1086,22 +1107,91 @@ async def preview_share(code: str):
     return {"waypoints": [_waypoint_dict(r) for r in rows]}
 
 
-@app.post("/api/waypoints/share/{code}/import")
-async def import_share(code: str, request: Request):
+@app.post("/api/waypoints/share/{code}/accept")
+async def accept_share(code: str, request: Request):
+    # Live share, onX-style: accepting a link does NOT copy the pin into the recipient's
+    # own `waypoints` rows. Instead it records a standing grant that lets this visitor read
+    # the owner's live row on every /api/waypoints load -- so edits the owner makes later
+    # (or the owner deleting the pin, via the FK's ON DELETE CASCADE on this table) are
+    # reflected automatically, and the owner can revoke access at any time from their side.
+    # The recipient can never edit or delete the original: every mutating waypoint endpoint
+    # checks `visitor_id` ownership, and a shared pin's `visitor_id` is always the owner's.
+    await rate_limit(f"share-accept:{client_ip(request)}", limit=20, window_seconds=60)
     vid = request.state.vid
+    share_res = await supabase.table("waypoint_shares").select("visitor_id").eq("code", code).limit(1).execute()
+    if not share_res.data:
+        raise HTTPException(404, "This share link is invalid or has expired")
+    owner_vid = share_res.data[0]["visitor_id"]
     rows = await _load_shared_ordered(code)
-    created = []
+    if owner_vid == vid:
+        # The sender opened their own link -- nothing to grant, these are already theirs.
+        return {"waypoints": [_waypoint_dict(r) for r in rows], "ownLink": True}
+    now = int(time.time())
     for row in rows:
-        item = WaypointBody(
-            type=row["type"],
-            lng=row["lng"],
-            lat=row["lat"],
-            label=row["label"],
-            note=row["note"],
-            confidence=row["confidence"],
-        )
-        created.append(await _insert_waypoint(vid, item, shared_from=code))
-    return {"waypoints": created}
+        await supabase.table("waypoint_share_grants").upsert(
+            {
+                "waypoint_id": row["id"],
+                "owner_vid": owner_vid,
+                "recipient_vid": vid,
+                "share_code": code,
+                "created_at": now,
+                "revoked_at": None,
+            },
+            on_conflict="waypoint_id,recipient_vid",
+        ).execute()
+    return {"waypoints": [_waypoint_dict(r, view_only=True) for r in rows], "ownLink": False}
+
+
+@app.get("/api/waypoints/{wp_id}/shares")
+async def list_waypoint_shares(wp_id: str, request: Request):
+    # Owner-only "who has this pin" view, for the Manage access list in the share modal.
+    vid = request.state.vid
+    wp_res = await supabase.table("waypoints").select("visitor_id").eq("id", wp_id).limit(1).execute()
+    if not wp_res.data:
+        raise HTTPException(404, "Waypoint not found")
+    if wp_res.data[0]["visitor_id"] != vid:
+        raise HTTPException(403, "This pin belongs to a different visitor")
+    res = await supabase.table("waypoint_share_grants").select("id,created_at").eq(
+        "waypoint_id", wp_id
+    ).is_("revoked_at", "null").order("created_at", desc=False).execute()
+    return {"grants": [{"id": g["id"], "createdAt": g["created_at"]} for g in res.data]}
+
+
+@app.post("/api/waypoints/{wp_id}/shares/{grant_id}/revoke")
+async def revoke_waypoint_share(wp_id: str, grant_id: int, request: Request):
+    # Owner revokes one recipient's access. Takes effect next time that recipient's app
+    # loads /api/waypoints -- there's no push channel to pull it off their map instantly.
+    vid = request.state.vid
+    wp_res = await supabase.table("waypoints").select("visitor_id").eq("id", wp_id).limit(1).execute()
+    if not wp_res.data:
+        raise HTTPException(404, "Waypoint not found")
+    if wp_res.data[0]["visitor_id"] != vid:
+        raise HTTPException(403, "This pin belongs to a different visitor")
+    res = await supabase.table("waypoint_share_grants").select("id").eq("id", grant_id).eq(
+        "waypoint_id", wp_id
+    ).is_("revoked_at", "null").limit(1).execute()
+    if not res.data:
+        raise HTTPException(404, "That share grant wasn't found or was already revoked")
+    await supabase.table("waypoint_share_grants").update({"revoked_at": int(time.time())}).eq(
+        "id", grant_id
+    ).execute()
+    return {"revoked": True}
+
+
+@app.delete("/api/waypoints/{wp_id}/my-share")
+async def remove_my_shared_waypoint(wp_id: str, request: Request):
+    # Recipient-side "remove from my map" -- hides a pin someone shared with you without
+    # touching the owner's original or anyone else it was shared with.
+    vid = request.state.vid
+    res = await supabase.table("waypoint_share_grants").select("id").eq("waypoint_id", wp_id).eq(
+        "recipient_vid", vid
+    ).is_("revoked_at", "null").limit(1).execute()
+    if not res.data:
+        raise HTTPException(404, "This pin isn't currently shared with you")
+    await supabase.table("waypoint_share_grants").update({"revoked_at": int(time.time())}).eq(
+        "id", res.data[0]["id"]
+    ).execute()
+    return {"removed": True}
 
 
 # ------------------------------------------------------------------------------------------
