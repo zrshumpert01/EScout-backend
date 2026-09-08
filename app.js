@@ -290,7 +290,19 @@
   // the actual owned/managed land (Category='Fee') and the Corps-lake project boundaries
   // (Category='Designation', e.g. Sardis/Grenada/Arkabutla/Okatibbee — all Pub_Access='OA')
   // fully intact, since those are recorded under different Category values.
-  const PADUS_ACCESS_FILTER = "Pub_Access <> 'XA' AND Category <> 'Proclamation'";
+  // Mississippi's entire 640,000+ acre 16th-Section Public School Trust Lands program is
+  // digitized in PAD-US as ONE multi-part feature (Unit_Nm='Mississippi 16th Section Public
+  // School Trust Lands', Own_Name='SLB') covering every one-square-mile leased trust section
+  // statewide -- and unlike genuinely private/closed parcels, PAD-US tags this record
+  // Pub_Access='OA' (Open Access), so the Pub_Access <> 'XA' filter above never touches it.
+  // Verified directly against the service's own query endpoint: this is a single distinct
+  // record (GIS_Acres=646,179, matching the state's own published ~640,000-acre trust-land
+  // total), so excluding it by exact Unit_Nm is a surgical fix -- it doesn't touch the state's
+  // other SLB-owned records (e.g. Red Creek WMA, small "State Lands" parcels), which stay
+  // genuinely open and unaffected. This is the land reported reappearing on the map as a grid
+  // of small squares (one square per leased section) -- it's leased to private individuals by
+  // local school districts, not open to public hunting/access despite PAD-US's OA tag.
+  const PADUS_ACCESS_FILTER = "Pub_Access <> 'XA' AND Category <> 'Proclamation' AND Unit_Nm <> 'Mississippi 16th Section Public School Trust Lands'";
   // IMPORTANT: this ArcGIS export endpoint's edge/WAF layer rejects ANY GET request whose
   // dynamicLayers JSON contains a definitionExpression with a boolean conjunction — a bare
   // AND/OR between two conditions returns HTTP 404 "specified URL cannot be found" even
