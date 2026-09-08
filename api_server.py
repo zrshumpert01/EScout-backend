@@ -1259,7 +1259,17 @@ async def save_view_state(body: ViewStateBody, request: Request):
 # deliberate approximation, not as precise as the primary's real Pub_Access field, and only
 # ever used while the primary is down.
 PADUS_PRIMARY_TILE_SERVICE = "https://edits.nationalmap.gov/arcgis/rest/services/PAD-US/PAD_US_Landforms/MapServer/export"
-PADUS_PRIMARY_LAYER_DEFS = json.dumps({0: "Pub_Access <> 'XA' AND Category <> 'Proclamation'"})
+# Mississippi's entire 640,000+ acre 16th-Section Public School Trust Lands program is
+# digitized in PAD-US as ONE multi-part feature (Unit_Nm='Mississippi 16th Section Public
+# School Trust Lands', Own_Name='SLB', GIS_Acres=646179) covering every one-square-mile leased
+# trust section statewide -- and PAD-US tags it Pub_Access='OA' (Open Access), so the bare
+# Pub_Access <> 'XA' filter never excluded it even though it's leased to private individuals by
+# local school districts and not open to public hunting/access. This is the land reported
+# reappearing on the map as a grid of small squares (one per leased section). Verified live
+# against the service's own query endpoint that this is a single distinct record, so excluding
+# it by exact Unit_Nm is surgical -- the state's other SLB-owned records (Red Creek WMA, small
+# "State Lands" parcels) are untouched and stay visible.
+PADUS_PRIMARY_LAYER_DEFS = json.dumps({0: "Pub_Access <> 'XA' AND Category <> 'Proclamation' AND Unit_Nm <> 'Mississippi 16th Section Public School Trust Lands'"})
 PADUS_PRIMARY_DYNAMIC_LAYERS = json.dumps([{
     "id": 0,
     "source": {"type": "mapLayer", "mapLayerId": 0},
