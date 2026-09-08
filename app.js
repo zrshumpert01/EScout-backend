@@ -98,12 +98,59 @@
   // ("2024-12-12") is a second real December capture, documented here for manual swap-in if
   // Esri ever retires 13192.
   const WAYBACK_WINTER_RELEASE_ID = 13192; // World Imagery (Wayback 2025-12-18)
+  // "Fall" previously had no distinct imagery behind it at all — satTilesFor() below only
+  // special-cased 'leafoff', so selecting Fall silently rendered identical tiles to
+  // Leaf-On (confirmed no-op by direct code inspection). Esri Wayback does publish
+  // occasional Oct/Nov-dated global releases, but the same caveat documented above for
+  // WAYBACK_WINTER_RELEASE_ID applies just as much here: a release's date label doesn't
+  // guarantee every specific tile actually got re-captured that month (confirmed by
+  // direct testing: the Nov 2025 and Oct 2025 releases returned byte-identical tiles at a
+  // wooded test location), so a real dated capture alone can't be trusted to reliably show
+  // fall color everywhere. Layer a warm orange/brown seasonal grade (tuned and visually
+  // verified against real NAIP/Esri test imagery) on top of the newest available fall-dated
+  // release instead, so the Fall pill is now always visibly, purposefully different from
+  // Leaf-On — genuinely fall-toned everywhere, and doubly so wherever the underlying
+  // capture happens to be real autumn foliage.
+  const FALL_WAYBACK_RELEASE_ID = 51127; // World Imagery (Wayback 2025-11-20)
+  const FALL_GRADE = 'sepia(0.55) saturate(1.7) hue-rotate(-20deg) contrast(1.1) brightness(0.98)';
+  // USGS NAIP (National Agriculture Imagery Program) — free, no-key, genuinely higher
+  // native resolution than Esri World Imagery in most rural areas (NAIP Plus: 6in-1m;
+  // standard NAIP mosaic: 0.6m), hosted on the same trusted nationalmap.gov domain family
+  // already used elsewhere in this app (elevation, hydro, PAD-US). Confirmed by direct
+  // side-by-side exportImage comparison against Esri World Imagery at multiple Mississippi
+  // test locations: NAIP showed materially crisper building/field/tree-line definition
+  // than Esri's "Live" mosaic at most spots — this is the fix for "areas the maps aren't as
+  // defined". It's a static ImageServer export (not a {z}/{x}/{y} tile cache), so it's
+  // fetched per-tile via exportImage + bbox, the same pattern already used for the USGS
+  // 3DEP contour / PAD-US overlays elsewhere in this file. NAIP capture dates also tend to
+  // be far more temporally consistent WITHIN one state/year than Esri's globally-blended
+  // "Live" mosaic, which helps with visibly patchy seams between adjacent tiles captured on
+  // different dates. Raw NAIP captures can carry uncorrected cloud/haze at specific
+  // locations/dates though (confirmed at one Sardis Lake test tile), and the ImageServer
+  // itself can have outages like any other nationalmap.gov service (confirmed separately
+  // for the PAD-US host) — see the escout-hires protocol below for the automatic
+  // NAIP Plus -> standard NAIP -> plain Esri fallback chain that guards against both.
+  const NAIP_PLUS_EXPORT = 'https://imagery.nationalmap.gov/arcgis/rest/services/USGSNAIPPlus/ImageServer/exportImage';
+  const NAIP_EXPORT = 'https://imagery.nationalmap.gov/arcgis/rest/services/USGSNAIPImagery/ImageServer/exportImage';
+  const NAIP_ATTR = 'USDA NAIP (USGS)';
   function satTilesFor(vintageId, seasonId) {
     if (seasonId === 'leafoff') {
       return 'escout-leafoff://{z}/{x}/{y}/{bbox-epsg-3857}';
     }
+    if (seasonId === 'fall') {
+      return 'escout-fall://{z}/{x}/{y}/{bbox-epsg-3857}';
+    }
     const v = imageryVintage(vintageId);
-    const raw = v.releaseId == null ? ESRI_SAT_RAW_TILES : WAYBACK_TILE_TEMPLATE.replace('{releaseId}', v.releaseId);
+    if (v.releaseId == null) {
+      // "Live" — route through the NAIP-first high-resolution pipeline (with an automatic
+      // fallback to plain Esri if NAIP's service is unreachable or has no coverage for this
+      // tile) instead of plain Esri, since NAIP is genuinely higher-resolution source
+      // imagery in most areas. A specific dated Wayback vintage below stays pure Esri — the
+      // whole point of picking a historical date is "this exact Esri capture", so it
+      // shouldn't silently get swapped for a different provider's imagery.
+      return 'escout-hires://{z}/{x}/{y}/{bbox-epsg-3857}';
+    }
+    const raw = WAYBACK_TILE_TEMPLATE.replace('{releaseId}', v.releaseId);
     return `escout-sharpen://${raw}`;
   }
   // Esri World Transportation — real road lines, street names, and highway/route number
@@ -134,21 +181,36 @@
   // standalone Topo basemap option).
   const USGS_TOPO_TILES = 'https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{z}/{y}/{x}';
   const USGS_TOPO_ATTR = 'USGS The National Map';
-  // USGS 3DEP elevation ImageServer — dynamically renders real contour lines (10ft
-  // interval, from actual lidar/DEM elevation data) as a transparent PNG overlay so
-  // contour lines are visible over ANY basemap, not baked into a single topo tile set.
+  // USGS 3DEP elevation ImageServer — dynamically renders real contour lines, from actual
+  // lidar/DEM elevation data, as a transparent PNG overlay so contour lines are visible
+  // over ANY basemap, not baked into a single topo tile set.
   const USGS_CONTOUR_SERVICE =
     'https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage';
-  const USGS_CONTOUR_RULE = encodeURIComponent(JSON.stringify({ rasterFunction: 'Preset 10ft Contour Interval' }));
-  const USGS_CONTOUR_RAW_TILES =
-    `${USGS_CONTOUR_SERVICE}?bbox={bbox-epsg-3857}&bboxSR=3857&imageSR=3857&size=256,256&format=png32&transparent=true&renderingRule=${USGS_CONTOUR_RULE}&f=image`;
+  // A fixed 10ft interval is exactly right up close (parcel-level scouting) but is WAY too
+  // dense once you're zoomed out over any real terrain: confirmed live at zoom 10 near
+  // Holly Springs NF, the 10ft lines packed so tightly across that much ground distance
+  // that, combined with the halo+thickening below, they merged into solid orange blocks
+  // that hid the imagery and roads entirely — exactly the "extremely bold and cluttered"
+  // report. Fixed by making the interval itself zoom-dependent, the same way real
+  // topographic maps use a coarser interval at small scale: "Contour Smoothed 25" (a
+  // heavily-generalized preset, confirmed via direct export comparison to render only
+  // major ridgelines/valleys instead of every small wrinkle) below the close-in threshold,
+  // the original fine "Preset 10ft Contour Interval" at/above it. Both are real presets
+  // exposed by this ImageServer's own rasterFunctionInfos endpoint.
+  const CONTOUR_ZOOM_DETAIL_THRESHOLD = 14;
+  const USGS_CONTOUR_RULE_FINE = encodeURIComponent(JSON.stringify({ rasterFunction: 'Preset 10ft Contour Interval' }));
+  const USGS_CONTOUR_RULE_COARSE = encodeURIComponent(JSON.stringify({ rasterFunction: 'Contour Smoothed 25' }));
   const USGS_CONTOUR_ATTR = 'USGS 3DEP';
   // The service always renders contour lines as near-black pixels, which disappear into
   // shadows/tree cover on satellite imagery. Route the tile through the escout-recolor
   // protocol (see below) to repaint every opaque pixel a bright, high-contrast color while
-  // keeping the original line shape (alpha channel) untouched.
+  // keeping the original line shape (alpha channel) untouched. The URL carries {z} (not
+  // just {bbox-epsg-3857}) so the protocol handler can pick the right interval preset AND
+  // scale the halo/thickening treatment down for the sparser zoomed-out tier — a lighter
+  // touch there so even the coarser lines don't overwhelm the map the way the uniformly-bold
+  // treatment did before.
   const CONTOUR_LINE_COLOR = 'ff6a00'; // vivid orange — reads clearly over green/brown terrain
-  const USGS_CONTOUR_TILES = `escout-recolor://${CONTOUR_LINE_COLOR}/${USGS_CONTOUR_RAW_TILES}`;
+  const USGS_CONTOUR_TILES = `escout-recolor://${CONTOUR_LINE_COLOR}/{z}/{bbox-epsg-3857}`;
   // USGS Hydro Cached — real named streams, rivers, ponds & lakes (National Hydrography
   // Dataset), rendered in blue on a transparent background. Layered together with the
   // contour overlay so "Topo Contours" shows both elevation lines AND water/creeks.
@@ -186,9 +248,10 @@
   // USFS, BLM, NPS, FWS, state WMAs/parks, county/city land, AND the Army Corps of
   // Engineers (Mang_Name='USACE', e.g. Corps lake and river-project land like the
   // Tenn-Tom Waterway/Okatibbee Lake recreation areas in Mississippi) — verified present
-  // via the service's own query endpoint. No definitionExpression filter is applied below,
-  // so every one of those managers, Corps of Engineers included, renders through
-  // unfiltered. NOTE: PAD-US's per-project USACE coverage is inconsistent — some projects
+  // via the service's own query endpoint. A definitionExpression IS applied below (see
+  // PADUS_ACCESS_FILTER) to strip closed-access records, but it doesn't touch agency
+  // coverage — every manager, Corps of Engineers included, still renders as long as the
+  // parcel is actually open. NOTE: PAD-US's per-project USACE coverage is inconsistent — some projects
   // (Okatibbee) are digitized as the full project footprint (land + water), while others
   // (Mark Twain Lake, MO) only got the reservoir's water surface digitized as a
   // Category='Designation' record, missing the tens of thousands of acres of surrounding
@@ -201,27 +264,59 @@
   // in) so the boundary reads as a clear, high-contrast highlight on ANY basemap, satellite
   // included, instead of relying on the service's own low-contrast default rendering.
   const PADUS_HIGHLIGHT_COLOR = [57, 255, 20]; // vivid "public land green"
+  // PAD-US's own Pub_Access field is the authoritative "is this actually open to the
+  // public" flag (XA=Closed, RA=Restricted, OA=Open, UK=Unknown) — separate from
+  // ownership (Own_Type) or manager (Mang_Type). Verified against Mississippi via the
+  // service's own query endpoint: of 1,983 MS records, 1,175 (59%) are Pub_Access='XA'
+  // (closed), and nearly all of those are private-land conservation easements bearing
+  // FWS/NRCS program names like "Farm Service Agency Interest Of MS" (Wetland Reserve
+  // Program easements the government holds a conservation interest in, but the
+  // underlying land stays privately owned and closed to public hunting/access) — exactly
+  // the private-land clutter reported on the map. Real public land (WMAs, national
+  // forests, refuges, state parks, Corps recreation areas) is overwhelmingly OA/RA/UK,
+  // not XA, so filtering out XA removes the private-easement noise while keeping every
+  // genuinely open parcel, including ones with Own_Type/Mang_Type of UNK (e.g. Pickwick
+  // Reservoir, J.P. Coleman State Park, Okatibbee Recreation Area all carry Pub_Access
+  // other than XA despite an UNK owner/manager type, so this is a strictly safer filter
+  // than excluding by ownership type would have been).
+  // PAD-US also carries a Category='Proclamation' record for most refuges/forests — the
+  // legally-proclaimed acquisition boundary the agency is *authorized* to buy land within,
+  // which is usually much bigger than the land it actually owns and is riddled with private
+  // inholdings. Verified against Mississippi: Tallahatchie NWR's proclamation boundary is
+  // 26,833 acres vs. only 4,186 acres of actual Fee-owned refuge land inside it (similar gaps
+  // for every other MS refuge checked — Dahomey NWR 57,707 vs 9,537, Noxubee NWR 61,618 vs
+  // 48,330). This is exactly the "big boundary wrapped around small blocks" look reported on
+  // the map. Excluding Category='Proclamation' removes that oversized outline while leaving
+  // the actual owned/managed land (Category='Fee') and the Corps-lake project boundaries
+  // (Category='Designation', e.g. Sardis/Grenada/Arkabutla/Okatibbee — all Pub_Access='OA')
+  // fully intact, since those are recorded under different Category values.
+  const PADUS_ACCESS_FILTER = "Pub_Access <> 'XA' AND Category <> 'Proclamation'";
+  // IMPORTANT: this ArcGIS export endpoint's edge/WAF layer rejects ANY GET request whose
+  // dynamicLayers JSON contains a definitionExpression with a boolean conjunction — a bare
+  // AND/OR between two conditions returns HTTP 404 "specified URL cannot be found" even
+  // though the same expression is accepted fine by the service's own /query endpoint (and
+  // even a single condition with no AND/OR works in dynamicLayers). Verified directly against
+  // this service: "Pub_Access <> 'XA'" alone works in dynamicLayers, "Category <> 'Proclamation'"
+  // alone works, "1=1 AND 2=2" (no quotes at all) still 404s, but the classic separate
+  // "layerDefs={<layerId>: <expression>}" parameter accepts the exact same AND expression
+  // without issue. So the definitionExpression is sent via layerDefs (filtering only, no
+  // rendering options), while dynamicLayers is kept purely for drawingInfo (renderer color +
+  // showLabels) with no definitionExpression of its own — the two parameters combine on the
+  // server side to filter AND restyle the same layer 0 in one request.
+  const PADUS_LAYER_DEFS = encodeURIComponent(JSON.stringify({ 0: PADUS_ACCESS_FILTER }));
   // Fill kept very faint (low alpha) and the outline thin so the highlight reads as a light
   // tint with a crisp boundary line, not a heavy block of color hiding the terrain/imagery
   // underneath it — the outline stays close to fully opaque so the boundary itself is still
   // easy to spot even though the fill is barely-there.
-  // Access/category filter: excludes Pub_Access='XA' (closed/no public access -- verified
-  // live against the service that this is overwhelmingly DOD installations and private
-  // conservation easements, e.g. Camp Shelby, which otherwise renders as a ~138,000-acre
-  // solid-green "public" block) and Category='Proclamation' (oversized "authorized
-  // acquisition boundary" outlines around refuges/forests that aren't themselves open
-  // ground). Embedded as this layer's own `definitionExpression` -- NOT the top-level
-  // `layerDefs` request parameter, which Esri's Export Map operation silently ignores
-  // whenever `dynamicLayers` is also present (verified live: identical output with and
-  // without layerDefs). Must use `NOT IN (...)` rather than `<> ... AND ... <> ...`: the
-  // nationalmap.gov WAF returns a hard 404 for two quoted `<>` comparisons joined by
-  // AND/OR in the same expression (verified live), which is exactly why the previous
-  // attempt at this same filter had no effect on the live map.
   const PADUS_DYNAMIC_LAYERS = encodeURIComponent(JSON.stringify([{
     id: 0,
     source: { type: 'mapLayer', mapLayerId: 0 },
-    definitionExpression: "Category NOT IN ('Proclamation') AND Pub_Access NOT IN ('XA')",
     drawingInfo: {
+      // The service's own layer definition draws Unit_Nm text labels (e.g. "Sardis Lake",
+      // "Holly Springs National Forest") on top of large-enough polygons by default
+      // (hasLabels=true on the source layer) — that's the on-map text reported as clutter.
+      // showLabels:false suppresses that default labeling entirely; the app has its own
+      // separate UI (popups/legend) for naming a parcel, so the map itself doesn't need it.
       showLabels: false,
       renderer: {
         type: 'simple',
@@ -234,8 +329,19 @@
       },
     },
   }]));
-  const USGS_PADUS_TILES =
-    `${USGS_PADUS_SERVICE}?bbox={bbox-epsg-3857}&bboxSR=3857&imageSR=3857&size=256,256&format=png32&transparent=true&layers=show:0&dynamicLayers=${PADUS_DYNAMIC_LAYERS}&f=image`;
+  // Routed through our own backend (escout-backend.onrender.com/api/tiles/public-land)
+  // instead of calling USGS_PADUS_SERVICE directly from the browser. Reason: this data
+  // source has had real outages (confirmed live: a 503 while investigating a user report of
+  // the overlay vanishing), and a plain MapLibre raster source has no way to retry a
+  // different data source when its one configured tile URL starts failing -- it just
+  // silently drops the tile, which looks identical to "no public land here" from the user's
+  // side. The backend route tries this exact same primary service/filter/style first (byte-
+  // identical PNG on success) and only falls back to a second live data source (DOE NETL's
+  // PAD-US mirror) if the primary errors, so an outage degrades gracefully instead of the
+  // layer going blank. Size/format/filter/style are now fixed server-side (see
+  // PADUS_PRIMARY_LAYER_DEFS/PADUS_PRIMARY_DYNAMIC_LAYERS in api_server.py, kept identical to
+  // PADUS_LAYER_DEFS/PADUS_DYNAMIC_LAYERS above), so only the bbox needs to travel here.
+  const USGS_PADUS_TILES = 'https://escout-backend.onrender.com/api/tiles/public-land?bbox={bbox-epsg-3857}';
   const USGS_PADUS_ATTR = 'USGS PAD-US';
   // USACE's own real-estate system of record (REMIS "Civil Works Land Data Migration"),
   // queried directly rather than through PAD-US. Reason: PAD-US's per-reservoir USACE
@@ -268,8 +374,18 @@
       },
     },
   }]));
-  const USACE_CWLDM_TILES =
-    `${USACE_CWLDM_SERVICE}?bbox={bbox-epsg-3857}&bboxSR=3857&imageSR=3857&size=256,256&format=png32&transparent=true&layers=show:5&dynamicLayers=${USACE_CWLDM_DYNAMIC_LAYERS}&f=image`;
+  // Routed through our own backend (escout-backend.onrender.com/api/tiles/usace-land)
+  // instead of calling USACE_CWLDM_SERVICE directly from the browser. Reason: confirmed live
+  // that geospatial.sec.usace.army.mil only sends Access-Control-Allow-Origin for requests
+  // whose Origin header is itself a *.usace.army.mil domain -- escouthunt.com/escout.pplx.app
+  // can never be on that allow-list, so this tile was permanently CORS-blocked in every
+  // browser regardless of whether the USACE server itself was up (a plain <img>/WebGL raster
+  // tile load needs crossOrigin='anonymous', which enforces the real CORS check). A
+  // server-to-server request from the backend has no Origin-based restriction, so proxying
+  // it there is the whole fix -- no change to USACE's own access policy needed. Size/format/
+  // layer/style are fixed server-side (see USACE_CWLDM_TILE_SERVICE/USACE_CWLDM_DYNAMIC_LAYERS
+  // in api_server.py, kept identical to the constants above), so only the bbox travels here.
+  const USACE_CWLDM_TILES = 'https://escout-backend.onrender.com/api/tiles/usace-land?bbox={bbox-epsg-3857}';
   const USACE_CWLDM_ATTR = 'USACE REMIS';
 
   // Statewide cadastral (parcel) services — free, no-key, publicly queryable ArcGIS
@@ -313,21 +429,39 @@
   // requesting nonexistent z20+ tiles that return blank "data not yet available" imagery —
   // this raises perceived resolution and removes the hard zoom ceiling.
   const IMAGERY_SOURCE_MAXZOOM = 19;
+  // NAIP (via escout-hires) is a live ImageServer export, not a pre-baked tile cache like
+  // Esri's, so unlike Esri there really is fresh, genuinely-higher-resolution imagery to
+  // fetch past z19 for a NAIP Plus (6in) coverage area — confirmed by direct side-by-side
+  // export comparison near a Tupelo test point (34.35, -88.7): a real z20 export showed
+  // visibly crisper edge detail (vehicle outline, parking-lot striping) than a z19 tile
+  // upscaled to the same display size. Only raised for the NAIP/hires satellite mode
+  // specifically — Esri-backed modes (historical Wayback vintages, Fall, Leaf-Off's Esri
+  // fallback) stay at IMAGERY_SOURCE_MAXZOOM since their tile cache is genuinely capped at
+  // z19 and a z20 request would just 404.
+  const IMAGERY_SOURCE_MAXZOOM_HIRES = 20;
 
   function rasterStyle(withPlaces, vintageId, seasonId) {
     // Real road lines, street names, and route-number shields are layered on top of the
     // satellite imagery on BOTH the standard satellite basemap and Hybrid — so road data
     // is visible by default, not hidden behind a separate mode.
+    const isNaipHiresMode = seasonId !== 'leafoff' && seasonId !== 'fall' && imageryVintage(vintageId || 'live').releaseId == null;
     const sources = {
       'escout-sat': {
         type: 'raster',
         tiles: [satTilesFor(vintageId || 'live', seasonId)],
         tileSize: 256,
-        maxzoom: IMAGERY_SOURCE_MAXZOOM,
+        maxzoom: isNaipHiresMode ? IMAGERY_SOURCE_MAXZOOM_HIRES : IMAGERY_SOURCE_MAXZOOM,
         // Leaf-Off blends in the real MARIS statewide Mississippi mosaic (see
         // escout-leafoff protocol), so credit that source alongside Esri for any tile that
-        // may have come from it.
-        attribution: seasonId === 'leafoff' ? `${ESRI_ATTR} · ${MARIS_LEAFOFF_ATTR}` : ESRI_ATTR,
+        // may have come from it. "Live" Leaf-On now routes through the NAIP-first
+        // escout-hires protocol, so credit USGS NAIP alongside Esri (the automatic fallback
+        // source) for that case too.
+        attribution:
+          seasonId === 'leafoff'
+            ? `${ESRI_ATTR} · ${MARIS_LEAFOFF_ATTR}`
+            : seasonId !== 'fall' && imageryVintage(vintageId || 'live').releaseId == null
+              ? `${NAIP_ATTR} · ${ESRI_ATTR}`
+              : ESRI_ATTR,
       },
       'escout-roads': {
         type: 'raster',
@@ -525,11 +659,30 @@
   // (opaque origin) localStorage is blocked, so we fall back to an in-memory id there —
   // but on the real published origin this id is generated once and persisted durably so
   // the same visitor keeps their subscription/waypoints across reloads and future visits.
+  //
+  // Durability against a full storage wipe: localStorage/cookies can all be cleared
+  // together (a browser "clear site data" action, some in-app-browser quirks, etc.),
+  // independently of an already-installed home-screen icon. Both iOS and Android
+  // permanently capture a PWA's manifest `start_url` at install time and re-navigate to
+  // that *exact* URL on every subsequent launch from the icon, regardless of what
+  // happens to storage in between. repointManifestLink() below keeps <link rel="manifest">
+  // pointed at a backend-generated manifest whose start_url already carries `?vid=<id>`
+  // (see /manifest.json in api_server.py), so any *future* install bakes this id in
+  // permanently. A `vid` found in the current launch URL is therefore trusted over
+  // localStorage — it's the one channel a storage wipe can't touch — and is used to
+  // repair localStorage back to the correct id rather than the other way around.
   function getOrCreateVisitorId() {
     const KEY = 'escout_visitor_id';
+    let urlVid = null;
+    try {
+      urlVid = new URLSearchParams(window.location.search).get('vid') || null;
+    } catch (e) { /* ignore */ }
     try {
       let id = localStorage.getItem(KEY);
-      if (!id) {
+      if (urlVid && urlVid !== id) {
+        id = urlVid;
+        localStorage.setItem(KEY, id);
+      } else if (!id) {
         id = (crypto.randomUUID && crypto.randomUUID()) || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
         localStorage.setItem(KEY, id);
       }
@@ -538,19 +691,79 @@
       // localStorage unavailable (e.g. opaque-origin sandboxed preview) — fall back to a
       // long-lived cookie, then finally an in-memory id that survives only this page load.
       try {
+        if (urlVid) return urlVid;
         const match = document.cookie.match(/(?:^|; )escout_visitor_id=([^;]+)/);
         if (match) return decodeURIComponent(match[1]);
         const id = (crypto.randomUUID && crypto.randomUUID()) || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
         document.cookie = `escout_visitor_id=${encodeURIComponent(id)}; max-age=${60 * 60 * 24 * 365 * 5}; path=/; SameSite=Lax`;
         return id;
       } catch (e2) {
-        if (!window.__escoutVisitorIdMemo) window.__escoutVisitorIdMemo = `mem-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        if (!window.__escoutVisitorIdMemo) window.__escoutVisitorIdMemo = urlVid || `mem-${Date.now()}-${Math.random().toString(36).slice(2)}`;
         return window.__escoutVisitorIdMemo;
       }
     }
   }
   const VISITOR_ID = getOrCreateVisitorId();
-  const API = '__PORT_8000__'.startsWith('__') ? 'http://localhost:8000' : '__PORT_8000__';
+  const API = 'https://escout-backend.onrender.com';
+
+  // Cosmetic only: strip a launch-time `vid` back out of the visible address bar once
+  // it's been captured into localStorage above. This does NOT touch the OS-level
+  // start_url an already-installed home-screen icon will replay on its next launch —
+  // that was captured once, permanently, at install time — it only tidies up this tab's
+  // own address bar for the rest of the session.
+  (function cleanVisitorIdFromUrl() {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      if (!params.has('vid')) return;
+      params.delete('vid');
+      const qs = params.toString();
+      const cleanUrl = window.location.pathname + (qs ? `?${qs}` : '') + window.location.hash;
+      window.history.replaceState({}, '', cleanUrl);
+    } catch (e) { /* ignore */ }
+  })();
+
+  // Repoint <link rel="manifest"> at the backend's per-visitor manifest so any FUTURE
+  // "Add to Home Screen" bakes the current, resolved VISITOR_ID into its start_url — see
+  // the /manifest.json route in api_server.py and the comment on getOrCreateVisitorId
+  // above. Existing home-screen icons already have their static start_url locked in and
+  // won't retroactively benefit from this — anyone still hitting the storage-wipe bug
+  // needs to remove and re-add the EScout icon once after this ships. Safe to run
+  // unconditionally: on the sandboxed preview (opaque origin) this just rewrites a <link>
+  // attribute that nothing acts on.
+  (function repointManifestLink() {
+    try {
+      const link = document.querySelector('link[rel="manifest"]');
+      if (!link) return;
+      const params = new URLSearchParams({ vid: VISITOR_ID, origin: window.location.origin });
+      link.setAttribute('href', `${API}/manifest.json?${params.toString()}`);
+    } catch (e) { /* ignore */ }
+  })();
+
+  // Optional extra hardening: mirror the resolved id into IndexedDB too. This is a
+  // one-way, best-effort write, not wired up as a read-back fallback — an async
+  // IndexedDB read can't be awaited before VISITOR_ID is computed above without either
+  // delaying startup or risking a race against the very first apiFetch call. localStorage
+  // and IndexedDB are cleared together by a full "clear site data" wipe anyway, so this
+  // doesn't protect against that; it only helps the narrower case of something clearing
+  // localStorage specifically while leaving IndexedDB intact. Never blocks startup.
+  (function mirrorVisitorIdToIndexedDB() {
+    try {
+      if (!window.indexedDB) return;
+      const req = indexedDB.open('escout-identity', 1);
+      req.onupgradeneeded = () => {
+        if (!req.result.objectStoreNames.contains('kv')) req.result.createObjectStore('kv');
+      };
+      req.onsuccess = () => {
+        try {
+          const db = req.result;
+          const tx = db.transaction('kv', 'readwrite');
+          tx.objectStore('kv').put(VISITOR_ID, 'escout_visitor_id');
+          tx.oncomplete = () => db.close();
+        } catch (e) { /* ignore */ }
+      };
+      req.onerror = () => { /* ignore */ };
+    } catch (e) { /* ignore */ }
+  })();
   let subscription = { tier: 'free', state: null };
   let subscriptionLoaded = false;
   async function apiFetch(path, options) {
@@ -563,7 +776,15 @@
     // to route the request at all, so it survives untouched. The header is kept only as a
     // harmless legacy fallback for any environment without the proxy in front of it.
     opts.headers = { ...(opts.headers || {}), 'X-Visitor-Id': VISITOR_ID };
-    opts.credentials = 'include';
+    // No `credentials: 'include'` here on purpose. The backend now lives on a different
+    // origin (Render) than the site, so this is a genuine cross-origin request; a
+    // credentialed cross-origin fetch requires the server to echo back a specific
+    // Access-Control-Allow-Origin (not "*") plus Access-Control-Allow-Credentials: true,
+    // and the escout_vid cookie is SameSite=Lax anyway, which browsers never send on
+    // cross-site fetch/XHR calls in the first place. Without this, browsers were failing
+    // the whole request outright (not just dropping the cookie), which silently reset
+    // subscription status to Free on every load. Identity already travels durably via the
+    // `vid` query parameter below, so no credentials are needed for any of this to work.
     const sep = path.includes('?') ? '&' : '?';
     const res = await fetch(`${API}${path}${sep}vid=${encodeURIComponent(VISITOR_ID)}`, opts);
     if (!res.ok) {
@@ -664,6 +885,46 @@
     }
   }
 
+  // Recovers a paid subscription onto whichever storage context is currently running, by
+  // looking it up in Stripe via the email used at checkout — see /api/restore/request and
+  // /api/restore/confirm in api_server.py for why this exists (iOS gives every separate
+  // home-screen install its own isolated storage/visitor id, so a payment made from one icon
+  // doesn't show up on another). Two steps so nobody can restore Premium just by knowing (not
+  // owning) someone else's email — a one-time code has to land in that actual inbox first.
+  async function requestRestoreCode(email) {
+    if (!email) return false;
+    try {
+      await apiFetch('/api/restore/request', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      });
+      toast('Check your email for a 6-digit code');
+      return true;
+    } catch (e) {
+      toast(e.message || "Couldn't send a code — try again shortly");
+      return false;
+    }
+  }
+
+  async function confirmRestoreCode(email, code) {
+    if (!email || !code) return false;
+    try {
+      const data = await apiFetch('/api/restore/confirm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, code }),
+      });
+      subscription = { tier: data.tier, state: null, source: 'stripe' };
+      refreshGatingUI();
+      toast('Premium restored on this device');
+      return true;
+    } catch (e) {
+      toast(e.message || "Couldn't find an active subscription for that email");
+      return false;
+    }
+  }
+
   async function confirmRedeemReturn() {
     // A complimentary-access link the owner sends looks like ?redeem=CODE. Opening it once
     // activates premium for exactly this visitor — see /api/redeem in api_server.py.
@@ -708,7 +969,7 @@
     return addUserWaypoint(
       wp.type,
       { lng: wp.lng, lat: wp.lat },
-      { label: wp.label, note: wp.note, confidence: wp.confidence },
+      { label: wp.label, note: wp.note, confidence: wp.confidence, viewOnly: !!wp.viewOnly },
       { id: wp.id, skipSave: true }
     );
   }
@@ -725,19 +986,25 @@
 
   async function confirmSharedWaypointsReturn() {
     // A pin-sharing link looks like ?wp=CODE (see the Share button in the Hunt Journal).
-    // Opening it once copies those pins into this visitor's own waypoints.
+    // Opening it once grants this visitor a LIVE, view-only link to those pins — they stay
+    // owned by whoever shared them, so edits/deletes on their end show up here automatically
+    // and this visitor can never edit, delete, or re-share them (see accept_share backend).
     const params = new URLSearchParams(window.location.search);
     const code = params.get('wp');
     if (!code) return;
     const cleanUrl = window.location.pathname;
     window.history.replaceState({}, '', cleanUrl);
     try {
-      const data = await apiFetch(`/api/waypoints/share/${encodeURIComponent(code)}/import`, { method: 'POST' });
+      const data = await apiFetch(`/api/waypoints/share/${encodeURIComponent(code)}/accept`, { method: 'POST' });
+      if (data.ownLink) {
+        toast("That's your own share link — those pins are already on your map");
+        return;
+      }
       const created = data.waypoints || [];
       created.forEach((wp) => addSavedWaypointToMap(wp));
       if (activeTab === 'journal') renderJournal();
       if (created.length) {
-        toast(`Added ${created.length} shared pin${created.length === 1 ? '' : 's'} to your map`);
+        toast(`Added ${created.length} shared pin${created.length === 1 ? '' : 's'} (view-only) to your map`);
         map.flyTo({ center: [created[0].lng, created[0].lat], zoom: 15.4, duration: 900 });
       } else {
         toast('This shared link has no pins to add');
@@ -751,7 +1018,7 @@
   function waypointShareLink(code) {
     return window.location.origin + window.location.pathname + '?wp=' + encodeURIComponent(code);
   }
-  function openShareModal(link, count) {
+  function openShareModal(link, count, ids) {
     const modal = document.getElementById('shareModal');
     const input = document.getElementById('shareLinkInput');
     const countEl = document.getElementById('shareModalCount');
@@ -759,6 +1026,48 @@
     input.value = link;
     if (countEl) countEl.textContent = count === 1 ? 'Sharing 1 pin' : `Sharing ${count} pins`;
     modal.classList.add('open');
+    // "Manage access" only makes sense for a single-pin share, where we can unambiguously
+    // ask the backend who currently holds a live grant on that one waypoint.
+    if (ids && ids.length === 1) {
+      renderShareAccessList(ids[0]);
+    } else {
+      const section = document.getElementById('shareAccessSection');
+      if (section) section.style.display = 'none';
+    }
+  }
+  async function renderShareAccessList(wpId) {
+    const section = document.getElementById('shareAccessSection');
+    const list = document.getElementById('shareAccessList');
+    if (!section || !list) return;
+    section.style.display = '';
+    list.innerHTML = '<li class="share-access-empty">Loading\u2026</li>';
+    try {
+      const data = await apiFetch(`/api/waypoints/${encodeURIComponent(wpId)}/shares`);
+      const grants = data.grants || [];
+      if (!grants.length) {
+        list.innerHTML = '<li class="share-access-empty">No one has accepted this link yet.</li>';
+        return;
+      }
+      list.innerHTML = '';
+      grants.forEach((g) => {
+        const when = new Date(g.createdAt * 1000).toLocaleDateString();
+        const li = document.createElement('li');
+        li.className = 'share-access-row';
+        li.innerHTML = `<span class="share-access-when">Accepted ${when}</span><button type="button" class="share-access-revoke" data-revoke-grant="${g.id}">Revoke</button>`;
+        li.querySelector('[data-revoke-grant]').addEventListener('click', async () => {
+          try {
+            await apiFetch(`/api/waypoints/${encodeURIComponent(wpId)}/shares/${g.id}/revoke`, { method: 'POST' });
+            toast('Access revoked');
+            renderShareAccessList(wpId);
+          } catch (e) {
+            toast(e.message || "Couldn't revoke access — try again");
+          }
+        });
+        list.appendChild(li);
+      });
+    } catch (e) {
+      list.innerHTML = '<li class="share-access-empty">Couldn\u2019t load who has access.</li>';
+    }
   }
   async function copyShareLink(text) {
     try {
@@ -775,7 +1084,7 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(ids && ids.length ? { ids } : {}),
       });
-      openShareModal(waypointShareLink(data.code), data.count);
+      openShareModal(waypointShareLink(data.code), data.count, ids && ids.length ? ids : null);
     } catch (e) {
       toast(e.message || "Couldn't create a share link — try again");
     }
@@ -876,36 +1185,81 @@
 
   // Recolors any raster tile's opaque pixels to a solid target color while preserving the
   // original alpha shape — used to turn the USGS contour service's near-black lines into a
-  // bright, clearly-visible color. URL shape: escout-recolor://<hexColorNoHash>/<real-url>
+  // bright, clearly-visible color. Also adds a dark blurred casing behind the line (the same
+  // silhouette-blur halo trick as escout-roadboost) and thickens the stroke slightly by
+  // max-combining a few sub-pixel-offset copies of the alpha mask before recoloring — a bare
+  // 1px vector line from the source service reads as too thin/faint at a glance, and without
+  // a dark casing the bright line can wash out against similarly-toned terrain (tan dirt,
+  // dry grass, and especially the warm orange-toned Fall satellite grade, which sits close
+  // in hue to the line color itself). URL shape: escout-recolor://<hexColorNoHash>/<real-url>
   maplibregl.addProtocol('escout-recolor', async (params) => {
-    const rest = params.url.slice('escout-recolor://'.length);
-    const splitAt = rest.indexOf('/');
-    const color = '#' + rest.slice(0, splitAt);
-    const realUrl = rest.slice(splitAt + 1);
+    // URL shape: escout-recolor://<hexColorNoHash>/<z>/<minX,minY,maxX,maxY>
+    const m = params.url.match(/^escout-recolor:\/\/([0-9a-fA-F]{6})\/(-?\d+)\/(-?[0-9.eE+-]+),(-?[0-9.eE+-]+),(-?[0-9.eE+-]+),(-?[0-9.eE+-]+)$/);
+    if (!m) throw new Error(`escout-recolor: bad url ${params.url}`);
+    const color = '#' + m[1];
+    const z = +m[2];
+    const bbox = `${m[3]},${m[4]},${m[5]},${m[6]}`;
+    // Zoomed out (regional view): switch to the heavily-generalized "Contour Smoothed 25"
+    // preset instead of the fine 10ft interval, and use a lighter halo/thickening pass — a
+    // wide view already compresses far more real ground distance into the same 256px tile,
+    // so even a coarser interval would still look bold if drawn with the close-in treatment.
+    // Zoomed in (parcel-level): the original fine 10ft interval with the full bold treatment.
+    const isCoarseTier = z < CONTOUR_ZOOM_DETAIL_THRESHOLD;
+    const rule = isCoarseTier ? USGS_CONTOUR_RULE_COARSE : USGS_CONTOUR_RULE_FINE;
+    const realUrl = `${USGS_CONTOUR_SERVICE}?bbox=${bbox}&bboxSR=3857&imageSR=3857&size=256,256&format=png32&transparent=true&renderingRule=${rule}&f=image`;
     const resp = await fetchWithRetry(realUrl);
     if (!resp.ok) throw new Error(`escout-recolor: tile fetch failed (${resp.status})`);
     const blob = await resp.blob();
     const bitmap = await createImageBitmap(blob);
+    const w = bitmap.width, h = bitmap.height;
     const canvas = document.createElement('canvas');
-    canvas.width = bitmap.width;
-    canvas.height = bitmap.height;
+    canvas.width = w;
+    canvas.height = h;
     const ctx = canvas.getContext('2d');
-    ctx.drawImage(bitmap, 0, 0);
-    ctx.globalCompositeOperation = 'source-in';
-    ctx.fillStyle = color;
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    // Dark halo layer: same silhouette-blur casing technique as escout-roadboost, drawn from
+    // the original (near-black) bitmap so it reads as a soft dark ring behind the line.
+    // A flat, uniform halo+thickening pass was drowning out the source renderer's own line
+    // weights: USGS draws index contours (every 5th line, the round elevation numbers) as
+    // a visibly thicker/doubled stroke than the intermediate lines in between, which is
+    // exactly the cue hunters use to read elevation at a glance and to spot a "bench" (a
+    // flat shelf showing as a locally wide gap between otherwise-tight lines). Adding the
+    // same fixed halo blur and thickening offsets to every line regardless of its native
+    // width bulks up the thin intermediate lines by roughly as much as the already-thick
+    // index lines, so everything converged on one uniform "bold" look and both the
+    // index/intermediate distinction and bench gaps disappeared. Fix: drop the thickening
+    // offsets entirely (the source's own stroke width already carries the signal) and pull
+    // the halo down to a light, thin casing that adds just enough contrast against terrain
+    // without re-bolding the line back into a flat block.
+    const haloBlur = isCoarseTier ? 1.2 : 1.4;
+    const haloPasses = isCoarseTier ? 1 : 1;
+    ctx.save();
+    ctx.shadowColor = isCoarseTier ? 'rgba(0, 0, 0, 0.6)' : 'rgba(0, 0, 0, 0.7)';
+    ctx.shadowBlur = haloBlur;
+    for (let i = 0; i < haloPasses; i++) ctx.drawImage(bitmap, 0, 0);
+    ctx.restore();
+    // Bright recolored line, painted on a separate canvas so the dark halo stays visible as
+    // a casing around it rather than being flattened to the same solid color. No artificial
+    // thickening offsets at either tier now — the source's native stroke width (thin
+    // intermediate vs. thick index contour) is preserved as-is instead of being averaged
+    // away.
+    const lineCanvas = document.createElement('canvas');
+    lineCanvas.width = w;
+    lineCanvas.height = h;
+    const lineCtx = lineCanvas.getContext('2d');
+    const offsets = [[0, 0]];
+    for (const [dx, dy] of offsets) lineCtx.drawImage(bitmap, dx, dy);
+    lineCtx.globalCompositeOperation = 'source-in';
+    lineCtx.fillStyle = color;
+    lineCtx.fillRect(0, 0, w, h);
+    ctx.drawImage(lineCanvas, 0, 0);
     const outBlob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
     return { data: await outBlob.arrayBuffer() };
   });
-  // Applies a contrast/saturation/clarity boost plus a real unsharp-mask edge-enhancement
-  // pass to satellite imagery tiles on arrival, for a visibly crisper, better-defined look
-  // beyond what a flat CSS filter alone can achieve. URL shape: escout-sharpen://<real-url>
-  maplibregl.addProtocol('escout-sharpen', async (params) => {
-    const realUrl = params.url.slice('escout-sharpen://'.length);
-    const resp = await fetchWithRetry(realUrl);
-    if (!resp.ok) throw new Error(`escout-sharpen: tile fetch failed (${resp.status})`);
-    const blob = await resp.blob();
-    const bitmap = await createImageBitmap(blob);
+  // Shared contrast/saturation/clarity boost plus a real unsharp-mask edge-enhancement
+  // pass, extracted so escout-sharpen (plain Esri/Wayback tiles), escout-hires (NAIP-first
+  // tiles), and escout-fall (graded fall tiles) all apply the exact same processing for a
+  // consistent, visibly crisper, better-defined look across every satellite source.
+  function sharpenBitmapCanvas(bitmap) {
     const w = bitmap.width, h = bitmap.height;
     const canvas = document.createElement('canvas');
     canvas.width = w;
@@ -942,6 +1296,18 @@
       // getImageData can throw on a tainted canvas in some environments — fall back to
       // the plain contrast/saturation/brightness filter pass already drawn above.
     }
+    return canvas;
+  }
+
+  // Applies the shared sharpen pass to satellite imagery tiles on arrival, for a visibly
+  // crisper, better-defined look beyond what a flat CSS filter alone can achieve.
+  // URL shape: escout-sharpen://<real-url>
+  maplibregl.addProtocol('escout-sharpen', async (params) => {
+    const realUrl = params.url.slice('escout-sharpen://'.length);
+    const resp = await fetchWithRetry(realUrl);
+    if (!resp.ok) throw new Error(`escout-sharpen: tile fetch failed (${resp.status})`);
+    const bitmap = await createImageBitmap(await resp.blob());
+    const canvas = sharpenBitmapCanvas(bitmap);
     const outBlob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.92));
     return { data: await outBlob.arrayBuffer() };
   });
@@ -957,12 +1323,128 @@
   // The halo alone guarantees every road, at every color, reads against both dark and light
   // backgrounds; the contrast/saturation pass makes the already-bold highway colors pop
   // too. URL shape: escout-roadboost://<real-url>
+  //
+  // Separately: at a normal "survey the whole tract/county" zoomed-out view, Esri's own
+  // tile cache applies scale-dependent generalization that drops minor/unclassified county
+  // and forest-service roads entirely — confirmed by direct comparison: a real gravel road
+  // fully visible at z14 was completely absent from the native z12/z13 tile at the same
+  // spot. This is baked into Esri's pre-rendered cache, not something a URL parameter can
+  // override, so the fix is to fetch a 2x2 mosaic of subtiles one zoom level IN (where
+  // minor roads DO render) and let it stand in for the requested tile — same real road
+  // data, just resampled from a scale Esri actually draws it at (and, as a side effect, a
+  // sharper "retina" tile since it packs 4x the source pixels into the same tile slot).
+  // Bounded to a reveal-relevant zoom band: below it, only major-road context is expected
+  // anyway; at/above it, the native tile already includes minor roads so the extra fetches
+  // would be wasted.
+  const ROAD_REVEAL_MIN_ZOOM = 11;
+  // This source declares tileSize:256, and MapLibre's raster tile-zoom selection is
+  // referenced to 512px tiles internally — for a 256px source it always requests the tile
+  // ONE ZOOM LEVEL HIGHER than the nominal camera zoom (confirmed directly: camera zoom 13
+  // triggers a request for the z14 tile URL, not z13). So a MAX_ZOOM of 14 here — meant to
+  // exempt "already zoomed in enough, minor roads should already render" cases from the
+  // reveal mosaic — was actually exempting camera zoom 13 (fetched z14), which is exactly
+  // the zoomed-out view the user reported roads vanishing at, and z14 is itself frequently
+  // still blank for minor roads (see ROAD_REVEAL_MAX_EXTRA_HOPS below). Raised to 15 (===
+  // ROADS_SOURCE_MAXZOOM, the finest tier this source ever fetches) so the mosaic reveal
+  // covers every camera zoom where a genuinely higher-resolution native tile still exists
+  // to fall back to; at z15 itself there's nowhere finer to go, so it correctly still takes
+  // the direct fast path below.
+  const ROAD_REVEAL_MAX_ZOOM = ROADS_SOURCE_MAXZOOM;
+  // For most rural roads, one zoom level "in" is enough to escape Esri's generalization and
+  // reveal the line. But for very minor roads the generalization gap can span MULTIPLE zoom
+  // levels — confirmed by direct inspection near Starkville, MS: a real, named county road
+  // (Cedar Grove Rd) rendered cleanly at native z15 but came back as Esri's fixed near-empty
+  // "no data at this LOD" placeholder tile (a byte-for-byte identical ~872-byte PNG) at z12,
+  // z13, AND z14 — three consecutive levels, not just one. A flat single-hop mosaic can land
+  // on another blank level and still show nothing.
+  //
+  // Fix: after fetching a subtile, check whether it's (near-)empty using the placeholder's
+  // known tiny size, and if so, drill one more zoom level in for JUST that quadrant and
+  // stitch the result back into its footprint — recursing up to ROAD_REVEAL_MAX_EXTRA_HOPS
+  // times. This is bounded per-quadrant (not a flat n×n refetch of the whole tile), so
+  // ordinary, already-populated areas pay zero extra fetches; only genuinely sparse/blank
+  // quadrants pay the recursive cost. The hop count is intentionally capped rather than
+  // recursing all the way to ROADS_SOURCE_MAXZOOM for every zoom in the reveal band — an
+  // uncapped drill for a truly roadless forest tile at the most zoomed-out end (z11) could
+  // fan out to hundreds of fetches for a tile that legitimately has nothing to find, which
+  // would reintroduce the exact "slow and laggy" problem already fixed earlier. Two hops is
+  // enough to resolve the z12/z13 cases (reaching z15, where Esri's own minor-road symbology
+  // reliably renders) while keeping the worst case bounded.
+  const ROAD_REVEAL_MAX_EXTRA_HOPS = 2;
+  const ROAD_BLANK_TILE_MAX_BYTES = 1000; // Esri's empty-LOD placeholder is a fixed ~872-byte PNG
+  async function fetchRoadQuadrant(z, y, x, baseUrl, hopsLeft) {
+    const url = `${baseUrl}/tile/${z}/${y}/${x}`;
+    let blob = null;
+    try {
+      const r = await fetchWithRetry(url);
+      if (r.ok) blob = await r.blob();
+    } catch {
+      blob = null;
+    }
+    if (!blob) return null;
+    if (hopsLeft > 0 && blob.size < ROAD_BLANK_TILE_MAX_BYTES && z < ROADS_SOURCE_MAXZOOM) {
+      const childZ = z + 1;
+      const children = await Promise.all([
+        fetchRoadQuadrant(childZ, y * 2, x * 2, baseUrl, hopsLeft - 1),
+        fetchRoadQuadrant(childZ, y * 2, x * 2 + 1, baseUrl, hopsLeft - 1),
+        fetchRoadQuadrant(childZ, y * 2 + 1, x * 2, baseUrl, hopsLeft - 1),
+        fetchRoadQuadrant(childZ, y * 2 + 1, x * 2 + 1, baseUrl, hopsLeft - 1),
+      ]);
+      if (children.some(Boolean)) {
+        const c = document.createElement('canvas');
+        c.width = 256;
+        c.height = 256;
+        const cctx = c.getContext('2d');
+        const half = 128;
+        const positions = [
+          [0, 0],
+          [half, 0],
+          [0, half],
+          [half, half],
+        ];
+        for (let i = 0; i < 4; i++) {
+          if (children[i]) cctx.drawImage(children[i], positions[i][0], positions[i][1], half, half);
+        }
+        return createImageBitmap(c);
+      }
+      // No content found even after drilling deeper — fall through and use the blank blob
+      // we already have rather than throwing the fetch away.
+    }
+    return createImageBitmap(blob);
+  }
+  async function fetchRoadTileBitmap(realUrl) {
+    const m = realUrl.match(/\/tile\/(\d+)\/(\d+)\/(\d+)$/);
+    if (!m || parseInt(m[1], 10) < ROAD_REVEAL_MIN_ZOOM || parseInt(m[1], 10) >= ROAD_REVEAL_MAX_ZOOM) {
+      const resp = await fetchWithRetry(realUrl);
+      if (!resp.ok) throw new Error(`escout-roadboost: tile fetch failed (${resp.status})`);
+      return createImageBitmap(await resp.blob());
+    }
+    const z = parseInt(m[1], 10), y = parseInt(m[2], 10), x = parseInt(m[3], 10);
+    const baseUrl = realUrl.slice(0, m.index);
+    const subZ = z + 1;
+    const fetches = [];
+    for (let dx = 0; dx < 2; dx++) {
+      for (let dy = 0; dy < 2; dy++) {
+        fetches.push(
+          fetchRoadQuadrant(subZ, y * 2 + dy, x * 2 + dx, baseUrl, ROAD_REVEAL_MAX_EXTRA_HOPS)
+            .then((bmp) => ({ dx, dy, bmp }))
+            .catch(() => ({ dx, dy, bmp: null }))
+        );
+      }
+    }
+    const tiles = await Promise.all(fetches);
+    const mosaic = document.createElement('canvas');
+    mosaic.width = 512;
+    mosaic.height = 512;
+    const mctx = mosaic.getContext('2d');
+    for (const { dx, dy, bmp } of tiles) {
+      if (bmp) mctx.drawImage(bmp, dx * 256, dy * 256, 256, 256);
+    }
+    return createImageBitmap(mosaic);
+  }
   maplibregl.addProtocol('escout-roadboost', async (params) => {
     const realUrl = params.url.slice('escout-roadboost://'.length);
-    const resp = await fetchWithRetry(realUrl);
-    if (!resp.ok) throw new Error(`escout-roadboost: tile fetch failed (${resp.status})`);
-    const blob = await resp.blob();
-    const bitmap = await createImageBitmap(blob);
+    const bitmap = await fetchRoadTileBitmap(realUrl);
     const w = bitmap.width, h = bitmap.height;
     const canvas = document.createElement('canvas');
     canvas.width = w;
@@ -1100,6 +1582,116 @@
     const canvas = gradedFallbackCanvas(await fallbackBitmap());
     if (marisBitmap) canvas.getContext('2d').drawImage(marisBitmap, 0, 0);
     const outBlob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+    return { data: await outBlob.arrayBuffer() };
+  });
+
+  // High-resolution primary satellite source for "Live"/Leaf-On: tries the USGS NAIP Plus
+  // ImageServer first (up to 6in resolution), falls back to the standard NAIP mosaic (0.6m)
+  // if Plus has no coverage or errors for this tile, and falls back again to plain Esri
+  // World Imagery if NAIP's service is unreachable entirely — so satellite view never goes
+  // blank even if imagery.nationalmap.gov has an outage (the same nationalmap.gov domain
+  // family that suffered a confirmed multi-minute PAD-US outage earlier this session).
+  // Whichever source wins still gets the same sharpen/unsharp-mask treatment as
+  // escout-sharpen for a consistent look across sources.
+  // URL shape: escout-hires://{z}/{x}/{y}/{bbox-epsg-3857}
+  // NAIP is only actually served by this protocol at the single zoom level Esri's own
+  // cached tile pyramid can't reach (z20, see IMAGERY_SOURCE_MAXZOOM_HIRES) — every level
+  // at or below IMAGERY_SOURCE_MAXZOOM (19) routes straight to the same fast, pre-rendered
+  // Esri tile the app always used, skipping the live/uncached NAIP export + 3-way fallback
+  // chain entirely. Confirmed live: with no gate, EVERY tile at EVERY zoom (regional
+  // overview included — 35 live exportImage calls just for one zoom-9 view near Tupelo) was
+  // going through NAIP's dynamic export plus a per-tile canvas sharpen/unsharp-mask pass,
+  // which is real, avoidable network + CPU overhead almost nobody would ever perceive as
+  // "higher resolution" at that scale — exactly the "loading in very slow and laggy" report.
+  // Gating to z20-only restores the original fast path for all normal browsing while still
+  // delivering genuinely higher resolution at maximum zoom, which is the one level where
+  // Esri has no native tile to fall back on anyway.
+  const NAIP_HIRES_MIN_ZOOM = IMAGERY_SOURCE_MAXZOOM_HIRES;
+  maplibregl.addProtocol('escout-hires', async (params) => {
+    const m = params.url.match(/^escout-hires:\/\/(\d+)\/(-?\d+)\/(-?\d+)\/(-?[0-9.eE+-]+),(-?[0-9.eE+-]+),(-?[0-9.eE+-]+),(-?[0-9.eE+-]+)$/);
+    if (!m) throw new Error(`escout-hires: bad url ${params.url}`);
+    const z = +m[1], x = +m[2], y = +m[3];
+    const minX = +m[4], minY = +m[5], maxX = +m[6], maxY = +m[7];
+
+    if (z < NAIP_HIRES_MIN_ZOOM) {
+      const fastUrl = ESRI_SAT_RAW_TILES.replace('{z}', z).replace('{y}', y).replace('{x}', x);
+      const fastResp = await fetchWithRetry(fastUrl);
+      if (!fastResp.ok) throw new Error(`escout-hires: Esri fast-path failed (${fastResp.status})`);
+      const fastBitmap = await createImageBitmap(await fastResp.blob());
+      const fastCanvas = sharpenBitmapCanvas(fastBitmap);
+      const fastBlob = await new Promise((resolve) => fastCanvas.toBlob(resolve, 'image/jpeg', 0.92));
+      return { data: await fastBlob.arrayBuffer() };
+    }
+
+    async function naipBitmap(exportUrl) {
+      // RSP_BilinearInterpolation matters most at z20: this Tupelo-area test tile (and any
+      // area lacking true NAIP Plus 6in coverage) falls through to the standard NAIP mosaic,
+      // whose native pixel is 0.6m — coarser than z20's ~0.149m/px target. exportImage's
+      // default nearest-neighbor resampling upsamples that 4x gap into visible flat color
+      // blocks ("blotchy squares"), confirmed live on escout.pplx.app after the z20 raise.
+      // Bilinear smooths that same upsample without discarding any real detail — verified
+      // side-by-side against a confirmed high-res NAIP Plus tile (vehicle outline, parking
+      // striping), where bilinear looks identical in real content, just anti-aliased instead
+      // of blocky.
+      const url = `${exportUrl}?bbox=${minX},${minY},${maxX},${maxY}&bboxSR=3857&imageSR=3857&size=256,256&format=png24&interpolation=RSP_BilinearInterpolation&f=image`;
+      const resp = await fetchWithRetry(url, 2, 300);
+      if (!resp.ok) throw new Error(`escout-hires: NAIP export failed (${resp.status})`);
+      const blob = await resp.blob();
+      if (blob.size < 200) throw new Error('escout-hires: NAIP export returned an empty tile');
+      return createImageBitmap(blob);
+    }
+
+    let bitmap;
+    try {
+      bitmap = await naipBitmap(NAIP_PLUS_EXPORT);
+    } catch (e) {
+      try {
+        bitmap = await naipBitmap(NAIP_EXPORT);
+      } catch (e2) {
+        // Esri's cached tile pyramid genuinely stops at z19 (unlike NAIP's live export
+        // service), so a z20 request here would 404 outright — clamp to the highest real
+        // Esri zoom and let MapLibre's own overzoom upscale it, same as the pre-existing
+        // above-z19 behavior for Esri-backed modes.
+        const fbZ = Math.min(z, IMAGERY_SOURCE_MAXZOOM);
+        const fbScale = 1 << (z - fbZ);
+        const fbX = Math.floor(x / fbScale);
+        const fbY = Math.floor(y / fbScale);
+        const rawUrl = ESRI_SAT_RAW_TILES.replace('{z}', fbZ).replace('{y}', fbY).replace('{x}', fbX);
+        const resp = await fetchWithRetry(rawUrl);
+        if (!resp.ok) throw new Error(`escout-hires: Esri fallback failed (${resp.status})`);
+        bitmap = await createImageBitmap(await resp.blob());
+      }
+    }
+
+    const canvas = sharpenBitmapCanvas(bitmap);
+    const outBlob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.92));
+    return { data: await outBlob.arrayBuffer() };
+  });
+
+  // "Fall" season: layers a warm autumn color grade (FALL_GRADE, tuned and visually
+  // verified against real test imagery) on top of the newest fall-dated Esri Wayback
+  // release (FALL_WAYBACK_RELEASE_ID) — fixes the previous no-op where this pill rendered
+  // identically to Leaf-On. Also runs through the same shared sharpening pass as the other
+  // satellite sources for consistent definition. URL shape:
+  // escout-fall://{z}/{x}/{y}/{bbox-epsg-3857} (the bbox segment is unused here but kept
+  // for a consistent URL shape with the other seasonal/hires protocols).
+  maplibregl.addProtocol('escout-fall', async (params) => {
+    const m = params.url.match(/^escout-fall:\/\/(\d+)\/(-?\d+)\/(-?\d+)\//);
+    if (!m) throw new Error(`escout-fall: bad url ${params.url}`);
+    const z = +m[1], x = +m[2], y = +m[3];
+    const rawUrl = WAYBACK_TILE_TEMPLATE.replace('{releaseId}', FALL_WAYBACK_RELEASE_ID).replace('{z}', z).replace('{y}', y).replace('{x}', x);
+    const resp = await fetchWithRetry(rawUrl);
+    if (!resp.ok) throw new Error(`escout-fall: tile fetch failed (${resp.status})`);
+    const bitmap = await createImageBitmap(await resp.blob());
+    const graded = document.createElement('canvas');
+    graded.width = bitmap.width;
+    graded.height = bitmap.height;
+    const gctx = graded.getContext('2d');
+    gctx.filter = FALL_GRADE;
+    gctx.drawImage(bitmap, 0, 0);
+    gctx.filter = 'none';
+    const canvas = sharpenBitmapCanvas(await createImageBitmap(graded));
+    const outBlob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.92));
     return { data: await outBlob.arrayBuffer() };
   });
 
@@ -1242,7 +1834,23 @@
         id: 'escout-topo-overlay-layer',
         type: 'raster',
         source: 'escout-topo-overlay',
-        paint: { 'raster-opacity': 0.9, 'raster-resampling': 'linear' },
+        paint: {
+          // Tapered by zoom on top of the escout-recolor tier switch: full strength once
+          // you're in the fine-detail 10ft band, eased down toward the regional view where
+          // the coarser preset now renders (see CONTOUR_ZOOM_DETAIL_THRESHOLD) so the
+          // transition between tiers is a fade rather than a hard cut.
+          // Even the generalized "Contour Smoothed 25" preset still packs tightly on genuinely
+          // rugged terrain (confirmed live over hilly ground near Bruce, MS at z12 — the coarse
+          // preset alone wasn't enough, lines still visually merged into solid bands at full
+          // strength), because on real hill country ANY contour interval is dense at small
+          // scale — that's an inherent property of the terrain, not something a coarser preset
+          // alone can fix. Cutting opacity hard at low zoom keeps the satellite imagery/roads
+          // legible underneath even where lines are packed tightly, while still showing
+          // relief as a texture; it ramps up to full strength only once you're at the
+          // parcel-scouting zoom the fine 10ft interval is meant for.
+          'raster-opacity': ['interpolate', ['linear'], ['zoom'], 9, 0.3, 11, 0.4, 12.5, 0.5, 14, 1],
+          'raster-resampling': 'linear',
+        },
       });
       map.setLayoutProperty('escout-topo-overlay-layer', 'visibility', layerState.contours ? 'visible' : 'none');
     }
@@ -1777,12 +2385,20 @@
   // toast when we detect a real service error while the layer is toggled on, so a genuine
   // outage doesn't get mistaken for a broken toggle.
   let padusErrorToastShown = false;
+  const PADUS_ERROR_SOURCE_IDS = new Set(['escout-public-land', 'escout-usace-lands']);
   map.on('error', (e) => {
-    const url = (e && e.error && e.error.url) || (e && e.tile && e.tile.url) || '';
-    const isPadus = typeof url === 'string' && (url.indexOf('PAD-US') !== -1 || url.indexOf('cwldm') !== -1);
+    // MapLibre's raster-source AJAXError doesn't reliably carry a `.url` field in this
+    // version (confirmed by directly logging live error events: e.error.url and e.tile.url
+    // both come back undefined even for a genuine PAD-US fetch failure) — so the previous
+    // URL-substring check against those undefined fields could never match, which meant
+    // this toast never actually fired during the real PAD-US outage that was making public
+    // land "not show" for the user. e.sourceId IS reliably populated (confirmed the same
+    // way, and already relied on elsewhere in this file for the tile-loading indicator), so
+    // match on that instead.
+    const isPadus = e && PADUS_ERROR_SOURCE_IDS.has(e.sourceId);
     if (isPadus && layerState.public && !padusErrorToastShown) {
       padusErrorToastShown = true;
-      toast('Public land data service is having trouble loading right now — the green highlight may be temporarily missing. Try panning or reopening the layer in a moment.');
+      toast('Public land data service (USGS) is having trouble loading right now — the green highlight may be temporarily missing. This is an outage on their end; try again in a few minutes.', 6000);
       setTimeout(() => { padusErrorToastShown = false; }, 45000);
     }
   });
@@ -1874,16 +2490,22 @@
         const def = wpDef(w.type);
         const row = document.createElement('div');
         row.className = 'wp-log-row';
-        row.innerHTML = `<span class="wp-log-icon">${waypointGlyphSvg(def)}</span><div class="li-text"><div class="li-title">${escapeHtml(w.label)}</div><div class="li-desc">${escapeHtml(def.label)}${w.confidence != null ? ' · ' + escapeHtml(w.confidence) + '% match' : ''}</div></div><button class="wp-share-btn" data-share-wp="${w.id}" aria-label="Share this waypoint"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.6 10.6l6.8-3.8M8.6 13.4l6.8 3.8"/></svg></button><button data-remove-wp="${w.id}" aria-label="Remove waypoint"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg></button>`;
+        const sharedTagHtml = w.viewOnly ? '<span class="tag shared-tag wp-log-shared-tag">Shared</span>' : '';
+        const shareBtnHtml = w.viewOnly
+          ? ''
+          : `<button class="wp-share-btn" data-share-wp="${w.id}" aria-label="Share this waypoint"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.6 10.6l6.8-3.8M8.6 13.4l6.8 3.8"/></svg></button>`;
+        row.innerHTML = `<span class="wp-log-icon">${waypointGlyphSvg(def)}</span><div class="li-text"><div class="li-title">${escapeHtml(w.label)}${sharedTagHtml}</div><div class="li-desc">${escapeHtml(def.label)}${w.confidence != null ? ' · ' + escapeHtml(w.confidence) + '% match' : ''}</div></div>${shareBtnHtml}<button data-remove-wp="${w.id}" aria-label="${w.viewOnly ? 'Remove from my map' : 'Remove waypoint'}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg></button>`;
         panelBody.appendChild(row);
         row.addEventListener('click', () => map.flyTo({ center: w.lngLat, zoom: 16.4, duration: 700 }));
-        row.querySelector('[data-share-wp]').addEventListener('click', (e) => {
+        const shareBtn = row.querySelector('[data-share-wp]');
+        if (shareBtn) shareBtn.addEventListener('click', (e) => {
           e.stopPropagation();
           shareWaypoints([w.id]);
         });
         row.querySelector('[data-remove-wp]').addEventListener('click', (e) => {
           e.stopPropagation();
-          removeUserWaypoint(w.id);
+          if (w.viewOnly) removeSharedWaypoint(w.id);
+          else removeUserWaypoint(w.id);
         });
       });
     }
@@ -1939,29 +2561,87 @@
   const isCoverCat = (cat) => cat === 'forest' || cat === 'shrub' || cat === 'wetland';
   const isFieldCat = (cat) => cat === 'pasture' || cat === 'crop';
 
-  // Routed through our own backend (escout-backend.onrender.com/api/scout/landcover) instead
-  // of calling the USDA NLCD service (geo.fas.usda.gov) directly from the browser. Reason:
-  // confirmed live on 2026-09-06 that geo.fas.usda.gov was completely unreachable (TLS
-  // handshake failures on every request), which silently turned every Scout AI scan into
-  // "no forest/shrub/wetland cover found" instead of a visible error, since every per-cell
-  // fetch failure here was swallowed by sampleGrid's .catch(() => null). The backend route
-  // tries this exact same USDA service first (identical classification codes on success) and
-  // falls back to a second live NLCD source (MRLC's public WMS) if the primary errors, so an
-  // outage degrades to a slower lookup instead of a wrongly-empty scan. It also collapses what
-  // used to be up to 64 simultaneous direct-to-government-server requests per scan into 64
-  // requests against our own backend instead, which is far less likely to get rate-limited or
-  // blocked than a browser hammering a federal ArcGIS server directly.
-  async function fetchLandCoverAt(lng, lat) {
-    const usp = new URLSearchParams({ lng, lat });
-    const res = await fetch(`${API}/api/scout/landcover?${usp.toString()}`);
-    if (!res.ok) throw new Error('Land cover service error ' + res.status);
+  // Every network call Scout AI makes gets a hard client-side timeout via AbortController.
+  // Without this, a hung/reset connection to a government ArcGIS host (which has no fixed
+  // upper bound on how long it can hang — a stalled TLS handshake or a connection the OS
+  // keeps silently retrying can block a bare `fetch()` indefinitely) leaves the enclosing
+  // Promise.all in sampleGrid() permanently unresolved, so the whole scan freezes on its
+  // first progress caption forever with no error ever surfaced to the user. Forcing every
+  // fetch to settle within a bounded time guarantees runScan()'s try/catch always gets a
+  // chance to run — either real results, or the existing "check your connection" toast.
+  async function fetchWithTimeout(url, ms) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ms);
+    try {
+      return await fetch(url, { signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function fetchLandCoverPrimary(lng, lat) {
+    const ext = 0.01;
+    const usp = new URLSearchParams({
+      geometry: `${lng},${lat}`,
+      geometryType: 'esriGeometryPoint',
+      sr: '4326',
+      tolerance: '1',
+      mapExtent: `${lng - ext},${lat - ext},${lng + ext},${lat + ext}`,
+      imageDisplay: '2,2,96',
+      returnGeometry: 'false',
+      f: 'json',
+    });
+    const res = await fetchWithTimeout(`${NLCD_SERVICE}/identify?${usp.toString()}`, 6000);
+    if (!res.ok) throw new Error('NLCD service error ' + res.status);
     const data = await res.json();
-    if (data.code == null || Number.isNaN(data.code)) return null;
-    return { code: data.code, label: LC_LABELS[data.code] || 'Unclassified' };
+    const attrs = data.results && data.results[0] && data.results[0].attributes;
+    if (!attrs) return null;
+    const code = parseInt(attrs['Raster.Value'], 10);
+    if (Number.isNaN(code)) return null;
+    return { code, label: attrs['Raster.NLCD Land Cover Class'] || LC_LABELS[code] || 'Unclassified' };
+  }
+  // Fallback land-cover source: the same NLCD Annual Land Cover dataset, hosted on Esri's
+  // own arcgis.com infrastructure instead of USDA's self-hosted geo.fas.usda.gov instance.
+  // Used only when the primary USDA service errors out or times out (e.g. its 2026-09
+  // outage — the whole host became unreachable at the connection level, confirmed from
+  // three independent networks). Returns the same Anderson Level II NLCD codes as the
+  // primary source (verified against known water/forest/crop points), so lcCategory()
+  // and LC_LABELS need no changes.
+  const NLCD_FALLBACK_SERVICE = 'https://di-nlcd.img.arcgis.com/arcgis/rest/services/USA_NLCD_Annual_LandCover/ImageServer';
+  const NLCD_FALLBACK_TIME = 1704067200000; // most recent year available in this mosaic's time extent
+  async function fetchLandCoverFallback(lng, lat) {
+    const usp = new URLSearchParams({
+      geometryType: 'esriGeometryPoint',
+      geometry: JSON.stringify({ x: lng, y: lat, spatialReference: { wkid: 4326 } }),
+      time: String(NLCD_FALLBACK_TIME),
+      returnFirstValueOnly: 'true',
+      f: 'json',
+    });
+    const res = await fetchWithTimeout(`${NLCD_FALLBACK_SERVICE}/getSamples?${usp.toString()}`, 6000);
+    if (!res.ok) throw new Error('NLCD fallback service error ' + res.status);
+    const data = await res.json();
+    const sample = data.samples && data.samples[0];
+    if (!sample || sample.value === undefined || sample.value === null || sample.value === 'NoData') return null;
+    const code = parseInt(sample.value, 10);
+    if (Number.isNaN(code)) return null;
+    return { code, label: LC_LABELS[code] || 'Unclassified' };
+  }
+  async function fetchLandCoverAt(lng, lat) {
+    try {
+      const primary = await fetchLandCoverPrimary(lng, lat);
+      if (primary) return primary;
+    } catch (e) {
+      // Primary USDA service down/timed out/errored — fall through to the Esri mirror below.
+    }
+    try {
+      return await fetchLandCoverFallback(lng, lat);
+    } catch (e) {
+      return null;
+    }
   }
   async function fetchElevationAt(lng, lat) {
     const usp = new URLSearchParams({ x: lng, y: lat, units: 'Feet', wkid: '4326', includeDate: 'false' });
-    const res = await fetch(`https://epqs.nationalmap.gov/v1/json?${usp.toString()}`);
+    const res = await fetchWithTimeout(`https://epqs.nationalmap.gov/v1/json?${usp.toString()}`, 8000);
     if (!res.ok) throw new Error('Elevation service error ' + res.status);
     const data = await res.json();
     const v = parseFloat(data.value);
@@ -1972,7 +2652,7 @@
       latitude: lat, longitude: lng, current: 'wind_speed_10m,wind_direction_10m',
       wind_speed_unit: 'mph', timezone: 'auto',
     });
-    const res = await fetch(`https://api.open-meteo.com/v1/forecast?${usp.toString()}`);
+    const res = await fetchWithTimeout(`https://api.open-meteo.com/v1/forecast?${usp.toString()}`, 6000);
     if (!res.ok) throw new Error('Wind service error ' + res.status);
     const data = await res.json();
     const speed = data.current && data.current.wind_speed_10m;
@@ -2177,23 +2857,15 @@
         cells.push({ r, c, lng, lat, inParcel: ring ? pointInRing([lng, lat], ring) : true });
       }
     }
-    // Promise.allSettled (not .catch(() => null) on both) so a genuine fetch failure --
-    // the land-cover service being unreachable -- is distinguishable from the service
-    // responding successfully with "no classified pixel here" (a real, valid no-data
-    // result, e.g. open water gaps or tile edges). Both used to collapse into the same
-    // 'unknown' category, which is why a data-source outage looked identical to "there's
-    // genuinely no forest/shrub/wetland in this view" instead of surfacing as an error.
     await Promise.all(
       cells.map(async (cell) => {
-        const [lcSettled, elevSettled] = await Promise.allSettled([
-          fetchLandCoverAt(cell.lng, cell.lat),
-          fetchElevationAt(cell.lng, cell.lat),
+        const [lc, elev] = await Promise.all([
+          fetchLandCoverAt(cell.lng, cell.lat).catch(() => null),
+          fetchElevationAt(cell.lng, cell.lat).catch(() => null),
         ]);
-        const lc = lcSettled.status === 'fulfilled' ? lcSettled.value : null;
-        const elev = elevSettled.status === 'fulfilled' ? elevSettled.value : null;
         cell.code = lc ? lc.code : null;
         cell.label = lc ? lc.label : 'No data';
-        cell.category = lc ? lcCategory(lc.code) : (lcSettled.status === 'rejected' ? 'error' : 'unknown');
+        cell.category = lc ? lcCategory(lc.code) : 'unknown';
         cell.elev = elev;
       })
     );
@@ -2556,16 +3228,9 @@
     const cells = await sampleGrid(bounds, ring);
     // hasField/hasCover only look at cells inside the selected parcel (or, with no
     // parcel selected, every cell is inParcel by default — same behavior as before).
-    const inScope = cells.filter((c) => c.inParcel);
-    const usable = inScope.filter((c) => c.category !== 'unknown' && c.category !== 'error');
+    const usable = cells.filter((c) => c.inParcel && c.category !== 'unknown');
     const hasField = cells.some((c) => c.inParcel && isFieldCat(c.category));
     const hasCover = cells.some((c) => c.inParcel && isCoverCat(c.category));
-    // If most sampled cells came back as real fetch failures (both the primary and fallback
-    // land-cover sources unreachable) rather than the service legitimately reporting no data,
-    // this is a provider outage, not an empty area — surface that distinction to the user
-    // instead of reporting "no cover found" on land that may well have cover.
-    const errored = inScope.filter((c) => c.category === 'error').length;
-    const providerDown = inScope.length > 0 && errored / inScope.length > 0.5;
     const results = [];
     const minSpacingYds = minPinSpacingYards(bounds);
     let corridorCandidates = [];
@@ -2581,7 +3246,7 @@
       const corridor = pickBestCorridor(corridorCandidates, biasSegment, avoidPts, minSpacingYds);
       if (corridor) results.push(corridor);
     }
-    return { cells, usableCount: usable.length, hasField, hasCover, providerDown, results };
+    return { cells, usableCount: usable.length, hasField, hasCover, results };
   }
 
   // Populated fresh at scan time from analyzeViewport() — this is the array everything else
@@ -2637,15 +3302,11 @@
     resultMarkers = [];
   }
 
-  // Live wind now loads first (see runScan below) so the actual scoring pass has a fresh
-  // reading to work with, instead of scoring against whatever wind was left over from the
-  // previous scan (or nothing at all on the very first scan of a session) and only fetching
-  // real wind afterward for display. Step order here follows that same real sequence now.
   const scanSteps = [
-    'Loading live wind — Open-Meteo…',
     'Pulling elevation & slope — USGS 3DEP…',
     'Reading forest & crop cover — NLCD…',
     'Checking creeks & wetlands in frame…',
+    'Loading live wind — Open-Meteo…',
     'Modeling deer movement — Scout AI engine…',
   ];
 
@@ -2748,17 +3409,12 @@
     const tick = () => new Promise((res) => setTimeout(res, minStepMs));
     try {
       advance(0);
-      // Wind is fetched and assigned to `liveWind` BEFORE analyzeViewport runs its scoring
-      // pass (buildFieldEdgeStand / buildBedding / pickBestCorridor all read the closured
-      // `liveWind` directly). Previously this happened in the opposite order, so every scan
-      // scored wind favorability using stale wind from the last scan — or nothing at all on
-      // the first scan of a session.
-      const [wind] = await Promise.all([fetchLiveWind(centerForWind.lng, centerForWind.lat).catch(() => null), tick()]);
-      if (wind) liveWind = wind;
-      advance(1);
       const [analysis] = await Promise.all([analyzeViewport(bounds, seasonForScan, ringForScan), tick()]);
-      advance(2);
+      advance(1);
       await tick();
+      advance(2);
+      const wind = await fetchLiveWind(centerForWind.lng, centerForWind.lat).catch(() => null);
+      if (wind) liveWind = wind;
       advance(3);
       await tick();
       advance(4);
@@ -2770,8 +3426,6 @@
       dropResultMarkers();
       if (activeResults.length) {
         toast('Scout AI found ' + activeResults.length + ' likely spot' + (activeResults.length === 1 ? '' : 's') + ' from real terrain data on ' + scopeLabel);
-      } else if (analysis.providerDown) {
-        toast('Scout AI couldn’t reach the land-cover data source for ' + scopeLabel + ' — this area may still have cover, try scanning again in a moment');
       } else if (!analysis.hasCover) {
         toast('No forest, shrub, or wetland cover detected on ' + scopeLabel + (selectedParcel ? '' : ' — pan toward timber for a scout read'));
       } else {
@@ -3476,24 +4130,35 @@
     const def = wpDef(record.type);
     const confHtml = record.confidence != null ? `<div class="popup-desc"><strong>${escapeHtml(record.confidence)}%</strong> Scout AI match confidence</div>` : '';
     const noteHtml = record.note ? `<div class="popup-desc">${escapeHtml(record.note)}</div>` : '';
+    const sharedTagHtml = record.viewOnly ? '<div class="popup-desc"><span class="tag shared-tag">Shared with you — view only</span></div>' : '';
+    const btnRowHtml = record.viewOnly
+      ? '<div class="popup-btn-row">' +
+        `<button class="popup-delete-btn" type="button" data-wp-unshare="${record.id}">` +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>Remove from my map</button>' +
+        '</div>'
+      : '<div class="popup-btn-row">' +
+        `<button class="popup-share-btn" type="button" data-wp-share="${record.id}">` +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.6 10.6l6.8-3.8M8.6 13.4l6.8 3.8"/></svg>Share</button>' +
+        `<button class="popup-delete-btn" type="button" data-wp-delete="${record.id}">` +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>Remove</button>' +
+        '</div>';
     const popup = new maplibregl.Popup({ offset: 18, maxWidth: '270px' })
       .setLngLat(record.lngLat)
       .setHTML(
-        `<div class="popup-title">${escapeHtml(record.label)}</div><div class="popup-desc"><strong>${escapeHtml(def.label)}</strong></div>${confHtml}${noteHtml}` +
-          '<div class="popup-btn-row">' +
-          `<button class="popup-share-btn" type="button" data-wp-share="${record.id}">` +
-          '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.6 10.6l6.8-3.8M8.6 13.4l6.8 3.8"/></svg>Share</button>' +
-          `<button class="popup-delete-btn" type="button" data-wp-delete="${record.id}">` +
-          '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>Remove</button>' +
-          '</div>'
+        `<div class="popup-title">${escapeHtml(record.label)}</div><div class="popup-desc"><strong>${escapeHtml(def.label)}</strong></div>${confHtml}${noteHtml}${sharedTagHtml}${btnRowHtml}`
       )
       .addTo(map);
     // Delegate the click since the popup's DOM node is only created once .addTo() runs.
-    popup.getElement().querySelector('[data-wp-share]').addEventListener('click', () => {
-      shareWaypoints([record.id]);
-    });
-    popup.getElement().querySelector('[data-wp-delete]').addEventListener('click', () => {
+    const shareBtn = popup.getElement().querySelector('[data-wp-share]');
+    if (shareBtn) shareBtn.addEventListener('click', () => shareWaypoints([record.id]));
+    const deleteBtn = popup.getElement().querySelector('[data-wp-delete]');
+    if (deleteBtn) deleteBtn.addEventListener('click', () => {
       removeUserWaypoint(record.id);
+      popup.remove();
+    });
+    const unshareBtn = popup.getElement().querySelector('[data-wp-unshare]');
+    if (unshareBtn) unshareBtn.addEventListener('click', () => {
+      removeSharedWaypoint(record.id);
       popup.remove();
     });
   }
@@ -3510,6 +4175,8 @@
     el.className = 'escout-marker';
     el.innerHTML = '<span class="marker-pop">' + waypointGlyphSvg(def) + '</span>';
     const marker = new maplibregl.Marker({ element: el }).setLngLat(lngLatObj).addTo(map);
+    const viewOnly = !!(meta && meta.viewOnly);
+    if (viewOnly) el.classList.add('shared-pin');
     const record = {
       id,
       type: typeId,
@@ -3518,6 +4185,7 @@
       label: (meta && meta.label) || def.label,
       note: meta && meta.note,
       confidence: meta && meta.confidence,
+      viewOnly,
     };
     el.addEventListener('click', (ev) => {
       ev.stopPropagation();
@@ -3576,6 +4244,20 @@
     }
     apiFetch('/api/waypoints/' + encodeURIComponent(id), { method: 'DELETE' }).catch(() => {
       toast('Removed here, but the server copy may reappear on reload');
+    });
+  }
+  function removeSharedWaypoint(id) {
+    // Recipient-side hide: drops this visitor's own view of a pin someone shared with them
+    // (via the /my-share endpoint) without touching the owner's original.
+    const idx = userWaypoints.findIndex((w) => w.id === id);
+    if (idx === -1) return;
+    const record = userWaypoints[idx];
+    record.marker.remove();
+    userWaypoints.splice(idx, 1);
+    if (activeTab === 'journal') renderJournal();
+    toast('Removed from your map');
+    apiFetch('/api/waypoints/' + encodeURIComponent(id) + '/my-share', { method: 'DELETE' }).catch(() => {
+      toast('Removed here, but it may reappear on reload');
     });
   }
 
@@ -3718,8 +4400,32 @@
     const isEdgeIOS = /EdgiOS/i.test(ua);
     return { isIOS, isInAppBrowser, isChromeIOS, isFirefoxIOS, isEdgeIOS };
   }
+  // Small glyphs matching the real icons a person will see in their own browser chrome
+  // (Safari's Share icon, an app-tile "add" icon, a \u2022\u2022\u2022 menu, a confirm checkmark) so the
+  // instructions are recognizable at a glance instead of requiring careful reading.
+  const INSTALL_STEP_ICONS = {
+    share: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v10"/><path d="M8 7l4-4 4 4"/><rect x="5" y="10" width="14" height="10" rx="2"/></svg>',
+    add: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="5"/><path d="M12 8v8M8 12h8"/></svg>',
+    dots: '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>',
+    confirm: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 13l4 4L19 7"/></svg>',
+  };
   function stepsHTML(steps) {
-    return '<ol class="install-steps">' + steps.map((s) => '<li>' + s + '</li>').join('') + '</ol>';
+    // steps: array of { icon: 'share'|'add'|'dots'|'confirm', html: '...' }
+    return (
+      '<ol class="install-steps">' +
+      steps
+        .map((s, i) => {
+          const svg = INSTALL_STEP_ICONS[s.icon] || INSTALL_STEP_ICONS.confirm;
+          return (
+            '<li class="install-step' + (i === 0 ? ' install-step-first' : '') + '">' +
+            '<span class="install-step-icon">' + svg + '<span class="install-step-icon-num">' + (i + 1) + '</span></span>' +
+            '<span class="install-step-text">' + s.html + '</span>' +
+            '</li>'
+          );
+        })
+        .join('') +
+      '</ol>'
+    );
   }
   function openInstallModal() {
     installModal.classList.add('open');
@@ -3754,30 +4460,30 @@
       actionBtn.style.display = 'none';
       statusText.textContent = "This link opened inside another app's built-in browser, which can't add anything to your Home Screen.";
       manualHint.innerHTML = stepsHTML([
-        'Tap the <strong>\u2022\u2022\u2022</strong> or <strong>share</strong> icon in this app\'s toolbar.',
-        'Choose <strong>"Open in Safari"</strong> (or "Open in Browser").',
-        'Once EScout opens in Safari, come back to this same screen and follow the Safari steps.',
+        { icon: 'share', html: 'Tap the <strong>\u2022\u2022\u2022</strong> or <strong>share</strong> icon in this app\'s toolbar.' },
+        { icon: 'confirm', html: 'Choose <strong>"Open in Safari"</strong> (or "Open in Browser").' },
+        { icon: 'confirm', html: 'Once EScout opens in Safari, come back to this same screen and follow the Safari steps.' },
       ]);
     } else if (isIOS && isChromeIOS) {
       statusText.textContent = 'Chrome on iPhone adds apps to your Home Screen manually:';
       manualHint.innerHTML = stepsHTML([
-        'Tap the <strong>Share</strong> icon (square with an arrow) to the right of the address bar.',
-        'Scroll down and tap <strong>"Add to Home Screen."</strong>',
-        'Tap <strong>Add</strong> in the top corner.',
+        { icon: 'share', html: 'Tap the <strong>Share</strong> icon (square with an arrow) to the right of the address bar.' },
+        { icon: 'add', html: 'Scroll down and tap <strong>"Add to Home Screen."</strong>' },
+        { icon: 'confirm', html: 'Tap <strong>Add</strong> in the top corner.' },
       ]);
     } else if (isIOS && isFirefoxIOS) {
       statusText.textContent = 'Firefox on iPhone adds apps to your Home Screen manually:';
       manualHint.innerHTML = stepsHTML([
-        'Tap the <strong>\u2022\u2022\u2022</strong> menu in the bottom toolbar.',
-        'Tap <strong>Share</strong>, then <strong>"Add to Home Screen."</strong>',
-        'Tap <strong>Add</strong> to confirm.',
+        { icon: 'dots', html: 'Tap the <strong>\u2022\u2022\u2022</strong> menu in the bottom toolbar.' },
+        { icon: 'add', html: 'Tap <strong>Share</strong>, then <strong>"Add to Home Screen."</strong>' },
+        { icon: 'confirm', html: 'Tap <strong>Add</strong> to confirm.' },
       ]);
     } else if (isIOS && isEdgeIOS) {
       statusText.textContent = 'Edge on iPhone adds apps to your Home Screen manually:';
       manualHint.innerHTML = stepsHTML([
-        'Tap the <strong>\u2022\u2022\u2022</strong> menu at the bottom of the screen.',
-        'Tap <strong>Share</strong>, then <strong>"Add to Home Screen."</strong>',
-        'Tap <strong>Add</strong> to confirm.',
+        { icon: 'dots', html: 'Tap the <strong>\u2022\u2022\u2022</strong> menu at the bottom of the screen.' },
+        { icon: 'add', html: 'Tap <strong>Share</strong>, then <strong>"Add to Home Screen."</strong>' },
+        { icon: 'confirm', html: 'Tap <strong>Add</strong> to confirm.' },
       ]);
     } else if (isIOS) {
       // Real Safari. iOS has shipped a couple of different tab-bar layouts (Compact/Bottom/Top),
@@ -3785,15 +4491,15 @@
       // covers that without needing to detect the exact layout.
       statusText.textContent = 'Safari on iPhone adds apps to your Home Screen manually:';
       manualHint.innerHTML = stepsHTML([
-        'Tap the <strong>Share</strong> icon (square with an arrow pointing up). If you don\'t see it, tap <strong>\u2022\u2022\u2022</strong> first, then Share.',
-        'Scroll down and tap <strong>"Add to Home Screen."</strong>',
-        'Tap <strong>Add</strong> in the top-right corner.',
+        { icon: 'share', html: 'Tap the <strong>Share</strong> icon (square with an arrow pointing up). If you don\'t see it, tap <strong>\u2022\u2022\u2022</strong> first, then Share.' },
+        { icon: 'add', html: 'Scroll down and tap <strong>"Add to Home Screen."</strong>' },
+        { icon: 'confirm', html: 'Tap <strong>Add</strong> in the top-right corner.' },
       ]);
     } else {
       statusText.textContent = 'Your browser handles installing this app manually:';
       manualHint.innerHTML = stepsHTML([
-        'Look for an install icon (\u2295 or a monitor icon) in your address bar.',
-        'Or open your browser menu and choose <strong>"Install EScout"</strong> / <strong>"Add to Home Screen."</strong>',
+        { icon: 'add', html: 'Look for an install icon (\u2295 or a monitor icon) in your address bar.' },
+        { icon: 'dots', html: 'Or open your browser menu and choose <strong>"Install EScout"</strong> / <strong>"Add to Home Screen."</strong>' },
       ]);
     }
   }
@@ -3831,17 +4537,64 @@
   if (installLinkCopyBtn) {
     installLinkCopyBtn.addEventListener('click', () => copyShareLink(installLinkInput.value));
   }
-  try {
-    if (new URLSearchParams(window.location.search).get('install') === '1' && !isStandalone()) {
-      // Give the browser a moment to fire beforeinstallprompt (Chrome/Edge/Android) before
-      // opening, so the real "Install EScout" button is ready instead of the manual-steps
-      // fallback flashing first. iOS Safari never fires that event — Apple gives web pages
-      // no API to trigger or complete "Add to Home Screen" themselves, so on iOS this modal
-      // can only show the same manual Share-icon steps a person would find on their own;
-      // a truly one-tap automatic install there isn't possible in any web app.
-      window.addEventListener('load', () => setTimeout(openInstallModal, 600));
+  /* ---------------- Auto-open install modal (unprompted, shown immediately on arrival) ---------------- */
+  // The full, centered install modal itself is the "can't miss it" prompt now — no small
+  // corner banner and no delay. It opens the instant the page is ready (this script runs
+  // after the DOM has parsed), dead-center over a dimmed backdrop, with a brief amber glow
+  // ring so it visually announces itself. Respects a "don't ask again for N days" dismissal
+  // in localStorage, and never appears once already running standalone/installed or inside
+  // an in-app browser where there's genuinely nothing to tap.
+  (function setupAutoInstallPrompt() {
+    var DISMISS_KEY = 'escoutInstallPromptDismissedAt';
+    var SNOOZE_DAYS = 14;
+    var installModalInner = installModal.querySelector('.install-modal');
+    var autoOpened = false;
+
+    function recentlyDismissed() {
+      try {
+        var raw = localStorage.getItem(DISMISS_KEY);
+        if (!raw) return false;
+        var dismissedAt = parseInt(raw, 10);
+        if (!dismissedAt) return false;
+        return Date.now() - dismissedAt < SNOOZE_DAYS * 24 * 60 * 60 * 1000;
+      } catch (e) {
+        return false; // localStorage unavailable (private mode, etc.) — default to showing
+      }
     }
-  } catch (e) { /* ignore malformed URL */ }
+    function rememberDismissal() {
+      try { localStorage.setItem(DISMISS_KEY, String(Date.now())); } catch (e) { /* ignore */ }
+    }
+    function openWithAttention() {
+      openInstallModal();
+      if (installModalInner) {
+        installModalInner.classList.remove('attention');
+        // Force reflow so the animation restarts if it's already mid-run.
+        void installModalInner.offsetWidth;
+        installModalInner.classList.add('attention');
+      }
+      autoOpened = true;
+    }
+
+    // installClose / backdrop-click already call closeInstallModal() elsewhere; hook the
+    // same buttons here too so an auto-opened prompt snoozes for a couple weeks once seen.
+    document.getElementById('installClose').addEventListener('click', function () {
+      if (autoOpened) { rememberDismissal(); autoOpened = false; }
+    });
+    installModal.addEventListener('click', function (e) {
+      if (e.target === installModal && autoOpened) { rememberDismissal(); autoOpened = false; }
+    });
+    window.addEventListener('appinstalled', function () { autoOpened = false; });
+
+    // A shared ?install=1 link is an explicit, deliberate request to see the prompt —
+    // honor it even if this visitor (or this shared device) snoozed the unprompted
+    // auto-open earlier.
+    var explicitInstallLink = new URLSearchParams(window.location.search).get('install') === '1';
+    if (isStandalone()) return;
+    if (!explicitInstallLink && recentlyDismissed()) return;
+    var ctx = detectBrowserContext();
+    if (ctx.isIOS && ctx.isInAppBrowser) return; // nothing actionable here — skip the nag
+    openWithAttention();
+  })();
 
   /* ---------------- Share-pin modal ---------------- */
   const shareModal = document.getElementById('shareModal');
@@ -4025,6 +4778,92 @@
     });
   }
 
+  // Manual "restore my paid subscription" entry — same rationale as the complimentary-code
+  // field above: reachable from inside whichever storage context is currently running. Two
+  // steps: email -> code sent -> code entered -> restored, so nobody can restore Premium just
+  // by knowing (not owning) someone else's checkout email.
+  const restoreToggle = document.getElementById('restoreToggle');
+  const restoreForm = document.getElementById('restoreForm');
+  const restoreInput = document.getElementById('restoreInput');
+  const restoreSendCode = document.getElementById('restoreSendCode');
+  const restoreCodeForm = document.getElementById('restoreCodeForm');
+  const restoreCodeInput = document.getElementById('restoreCodeInput');
+  const restoreSubmit = document.getElementById('restoreSubmit');
+  const restoreResend = document.getElementById('restoreResend');
+  if (restoreToggle && restoreForm && restoreInput && restoreSendCode && restoreCodeForm && restoreCodeInput && restoreSubmit && restoreResend) {
+    let restoreEmailPending = '';
+
+    const resetRestoreUI = () => {
+      restoreForm.style.display = 'none';
+      restoreCodeForm.style.display = 'none';
+      restoreResend.style.display = 'none';
+      restoreInput.value = '';
+      restoreCodeInput.value = '';
+      restoreEmailPending = '';
+    };
+
+    restoreToggle.addEventListener('click', () => {
+      const showing = restoreForm.style.display !== 'none' || restoreCodeForm.style.display !== 'none';
+      if (showing) {
+        resetRestoreUI();
+      } else {
+        restoreForm.style.display = 'flex';
+        restoreInput.focus();
+      }
+    });
+
+    const submitSendCode = async () => {
+      const email = restoreInput.value.trim();
+      if (!email) return;
+      restoreSendCode.disabled = true;
+      const original = restoreSendCode.textContent;
+      restoreSendCode.textContent = 'Sending\u2026';
+      try {
+        const ok = await requestRestoreCode(email);
+        if (ok) {
+          restoreEmailPending = email;
+          restoreForm.style.display = 'none';
+          restoreCodeForm.style.display = 'flex';
+          restoreResend.style.display = 'inline';
+          restoreCodeInput.focus();
+        }
+      } finally {
+        restoreSendCode.disabled = false;
+        restoreSendCode.textContent = original;
+      }
+    };
+    restoreSendCode.addEventListener('click', submitSendCode);
+    restoreInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') submitSendCode();
+    });
+
+    const submitVerify = async () => {
+      const code = restoreCodeInput.value.trim();
+      if (!code || !restoreEmailPending) return;
+      restoreSubmit.disabled = true;
+      const original = restoreSubmit.textContent;
+      restoreSubmit.textContent = 'Verifying\u2026';
+      try {
+        const ok = await confirmRestoreCode(restoreEmailPending, code);
+        if (ok) resetRestoreUI();
+      } finally {
+        restoreSubmit.disabled = false;
+        restoreSubmit.textContent = original;
+      }
+    };
+    restoreSubmit.addEventListener('click', submitVerify);
+    restoreCodeInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') submitVerify();
+    });
+
+    restoreResend.addEventListener('click', async () => {
+      if (!restoreEmailPending) return;
+      restoreResend.disabled = true;
+      await requestRestoreCode(restoreEmailPending);
+      restoreResend.disabled = false;
+    });
+  }
+
   map.on('moveend', () => {
     // Keep the open panel (Intel acreage / Scout AI frame stat) in sync with the current
     // viewport for any tier that has map-dependent UI.
@@ -4044,6 +4883,30 @@
     .then(() => confirmRedeemReturn())
     .then(() => confirmSharedWaypointsReturn())
     .finally(() => loadSubscription());
+
+  // Checkout (and the billing portal) open in a separate tab — see startCheckout()/
+  // openBillingPortal() above, opened via window.open('_blank') because the in-app preview
+  // runs in a sandboxed iframe that can't top-navigate to Stripe. Stripe's success redirect
+  // therefore lands in THAT new tab, not this one, so this original tab's in-memory
+  // `subscription` (and the "Free Plan" chip) never learns a payment went through until the
+  // user manually reloads. Re-checking whenever this tab regains focus/visibility closes that
+  // gap for checkout, billing-portal cancellations, and comp-code redemptions alike, without
+  // needing a cross-tab messaging channel. Lightly throttled so rapid tab-switching doesn't
+  // hammer the endpoint.
+  let __lastSubscriptionRefresh = Date.now();
+  function refreshSubscriptionIfStale() {
+    if (Date.now() - __lastSubscriptionRefresh < 4000) return;
+    __lastSubscriptionRefresh = Date.now();
+    loadSubscription();
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') refreshSubscriptionIfStale();
+  });
+  window.addEventListener('focus', refreshSubscriptionIfStale);
+  // Also covers the back-forward cache case (e.g. returning via the browser's back button
+  // after the checkout tab redirected) where the page is restored from bfcache rather than
+  // reloaded, so no new 'load'/script-execution happens at all.
+  window.addEventListener('pageshow', (e) => { if (e.persisted) refreshSubscriptionIfStale(); });
 
   /* ---------------- Onboarding hint ---------------- */
   setTimeout(() => toast('Try the AI Scout tool — tap the glowing icon on the left dock', 4200), 900);
