@@ -1308,7 +1308,25 @@ NETL_FALLBACK_QUERY_URL = (
     "https://arcgis.netl.doe.gov/server/rest/services/Hosted/"
     "Protected_Areas_Database_for_the_United_States_PADUS/FeatureServer/32/query"
 )
-NETL_FALLBACK_WHERE = "category NOT IN ('Proclamation', 'Easement')"
+# NETL's own hosted PAD-US mirror doesn't carry a Pub_Access-equivalent field (its schema is
+# limited to category/own_type/own_name/loc_own/ownermanager -- verified directly against the
+# service's own metadata), so it can't replicate the primary source's Pub_Access <> 'XA' filter
+# above. As a best-effort approximation using the fields it does have: own_name's own coded
+# domain distinguishes named, unambiguous public categories (SFW = "State Fish and Wildlife"
+# i.e. WMAs, SPR = "State Park and Recreation") from the catch-all "SLB" (State Land Board) /
+# "OTHS" (Other or Unknown State Land) bucket. SLB is literally the agency type that
+# administers leased state-trust land (e.g. Mississippi's 16th-Section school-trust program) in
+# many states, and a live query of Mississippi's own STAT-owned records on the primary source
+# confirmed this OTHS/SLB bucket mixes genuinely open land with Pub_Access='XA' (closed) leased
+# parcels -- exactly the previously-filtered land reported as reappearing. Excluding own_type
+# STAT records whose own_name falls in that ambiguous bucket keeps named WMAs/state parks fully
+# intact while dropping the parcels most likely to be closed/leased trust land, on the rare
+# tiles that ever reach this fallback path (see the retry/timeout hardening above, which should
+# make that rare).
+NETL_FALLBACK_WHERE = (
+    "category NOT IN ('Proclamation', 'Easement') "
+    "AND NOT (own_type = 'STAT' AND own_name IN ('SLB', 'OTHS', 'UNK'))"
+)
 PADUS_FILL_RGBA = (57, 255, 20, 10)
 PADUS_OUTLINE_RGBA = (57, 255, 20, 210)
 TILE_SIZE = 256
@@ -1407,15 +1425,22 @@ async def public_land_tile(bbox: str):
         "dynamicLayers": PADUS_PRIMARY_DYNAMIC_LAYERS,
         "f": "image",
     }
-    try:
-        resp = await http_client.get(
-            PADUS_PRIMARY_TILE_SERVICE, params=primary_params, timeout=httpx.Timeout(6.0)
-        )
-        content_type = resp.headers.get("content-type", "")
-        if resp.status_code == 200 and content_type.startswith("image/"):
-            return Response(content=resp.content, media_type=content_type, headers={"X-Tile-Source": "padus-primary"})
-    except (httpx.TimeoutException, httpx.HTTPError):
-        pass  # fall through to NETL fallback below
+    # The NETL fallback below can't replicate the primary's Pub_Access closed-access filter (see
+    # NETL_FALLBACK_WHERE), so every fallback-served tile is a strictly worse approximation --
+    # worth one retry on a short backoff before accepting that trade-off, since the primary is
+    # normally fast (sub-second) and a bare single timeout was tripping on transient blips alone.
+    for attempt in range(2):
+        try:
+            resp = await http_client.get(
+                PADUS_PRIMARY_TILE_SERVICE, params=primary_params, timeout=httpx.Timeout(10.0)
+            )
+            content_type = resp.headers.get("content-type", "")
+            if resp.status_code == 200 and content_type.startswith("image/"):
+                return Response(content=resp.content, media_type=content_type, headers={"X-Tile-Source": "padus-primary"})
+        except (httpx.TimeoutException, httpx.HTTPError):
+            pass  # retry once, then fall through to NETL fallback below
+        if attempt == 0:
+            await asyncio.sleep(0.4)
 
     xmin, ymin, xmax, ymax = parsed_bbox
     query_params = {
@@ -1425,7 +1450,7 @@ async def public_land_tile(bbox: str):
         "outSR": 3857,
         "spatialRel": "esriSpatialRelIntersects",
         "where": NETL_FALLBACK_WHERE,
-        "outFields": "category,own_type",
+        "outFields": "category,own_type,own_name",
         "returnGeometry": "true",
         "geometryPrecision": 2,
         "f": "json",
