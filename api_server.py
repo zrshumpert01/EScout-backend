@@ -1258,7 +1258,7 @@ async def save_view_state(body: ViewStateBody, request: Request):
 # the oversized "authorized acquisition boundary" outline around refuges/forests). This is a
 # deliberate approximation, not as precise as the primary's real Pub_Access field, and only
 # ever used while the primary is down.
-PADUS_PRIMARY_TILE_SERVICE = "https://edits.nationalmap.gov/arcgis/rest/services/PAD-US/PAD_US_Landforms/MapServer/export"
+PADUS_PRIMARY_QUERY_URL = "https://edits.nationalmap.gov/arcgis/rest/services/PAD-US/PAD_US_Landforms/MapServer/0/query"
 # Mississippi's entire 640,000+ acre 16th-Section Public School Trust Lands program is
 # digitized in PAD-US as ONE multi-part feature (Unit_Nm='Mississippi 16th Section Public
 # School Trust Lands', Own_Name='SLB', GIS_Acres=646179) covering every one-square-mile leased
@@ -1269,7 +1269,25 @@ PADUS_PRIMARY_TILE_SERVICE = "https://edits.nationalmap.gov/arcgis/rest/services
 # against the service's own query endpoint that this is a single distinct record, so excluding
 # it by exact Unit_Nm is surgical -- the state's other SLB-owned records (Red Creek WMA, small
 # "State Lands" parcels) are untouched and stay visible.
-PADUS_PRIMARY_LAYER_DEFS = json.dumps({0: "Pub_Access <> 'XA' AND Category <> 'Proclamation' AND Unit_Nm <> 'Mississippi 16th Section Public School Trust Lands'"})
+PADUS_PRIMARY_WHERE = (
+    "Pub_Access <> 'XA' AND Category <> 'Proclamation' "
+    "AND Unit_Nm <> 'Mississippi 16th Section Public School Trust Lands'"
+)
+# IMPORTANT -- do not resurrect the old /export + layerDefs/dynamicLayers approach here.
+# Confirmed live (2026-09-08) that this MapServer's /export endpoint SILENTLY IGNORES the
+# top-level `layerDefs` parameter whenever `dynamicLayers` is also present (needed for the
+# custom thin-outline styling) -- requests with `layerDefs` set to the real filter, to `1=1`,
+# and to `1=0` all returned byte-identical images, proving no filter was ever actually being
+# applied on that path despite returning 200. Moving the filter into `dynamicLayers[0].
+# definitionExpression` (the ArcGIS-documented way to filter a layer when dynamicLayers is in
+# use) DOES get respected by the server for a single condition, but a front-end WAF in front of
+# this host 404s any request combining two or more conditions with `AND` inside that JSON param
+# (confirmed: each condition alone succeeds, every 2-condition combination 404s) -- so the real
+# 3-condition filter can never reach the server via /export at all. The plain `/0/query`
+# endpoint's flat `where` param has neither problem (verified: correctly excludes the 16th-
+# section record and returns only the 29 legitimate features expected for a test area), so that
+# is now the primary path -- see public_land_tile() below, which queries geometry and rasterizes
+# it with the same helper used for the NETL fallback.
 PADUS_PRIMARY_DYNAMIC_LAYERS = json.dumps([{
     "id": 0,
     "source": {"type": "mapLayer", "mapLayerId": 0},
@@ -1411,48 +1429,54 @@ def _rasterize_netl_features(features: list[dict], bbox: tuple[float, float, flo
 
 @app.get("/api/tiles/public-land")
 async def public_land_tile(bbox: str):
-    """Proxies the PAD-US public-land highlight tile: tries the primary MapServer /export
-    first (byte-for-byte passthrough on success), falls back to querying+rasterizing the DOE
-    NETL mirror only if the primary errors or times out. Always returns a 200 PNG (falling
-    back to a blank transparent tile if BOTH sources fail) so a data-source outage degrades
-    to "no highlight this tile" instead of surfacing as a broken image/console error --
-    consistent with how a tile with genuinely no public land nearby already renders.
+    """Serves the PAD-US public-land highlight tile by querying the primary source's feature
+    layer directly (geometry + attributes for the tile's bbox, filtered server-side by
+    PADUS_PRIMARY_WHERE) and rasterizing the result ourselves -- NOT via the MapServer's
+    /export endpoint, which cannot reliably apply this filter at all (see the long comment on
+    PADUS_PRIMARY_WHERE above for why). Falls back to querying+rasterizing the DOE NETL mirror
+    only if the primary query errors or times out. Always returns a 200 PNG (falling back to a
+    blank transparent tile if BOTH sources fail) so a data-source outage degrades to "no
+    highlight this tile" instead of surfacing as a broken image/console error -- consistent
+    with how a tile with genuinely no public land nearby already renders.
     """
     try:
         parsed_bbox = _parse_bbox(bbox)
     except ValueError:
         raise HTTPException(status_code=400, detail="invalid bbox")
 
-    primary_params = {
-        "bbox": bbox,
-        "bboxSR": 3857,
-        "imageSR": 3857,
-        "size": f"{TILE_SIZE},{TILE_SIZE}",
-        "format": "png32",
-        "transparent": "true",
-        "layers": "show:0",
-        "layerDefs": PADUS_PRIMARY_LAYER_DEFS,
-        "dynamicLayers": PADUS_PRIMARY_DYNAMIC_LAYERS,
-        "f": "image",
+    xmin, ymin, xmax, ymax = parsed_bbox
+    primary_query_params = {
+        "geometry": f"{xmin},{ymin},{xmax},{ymax}",
+        "geometryType": "esriGeometryEnvelope",
+        "inSR": 3857,
+        "outSR": 3857,
+        "spatialRel": "esriSpatialRelIntersects",
+        "where": PADUS_PRIMARY_WHERE,
+        "outFields": "Unit_Nm",
+        "returnGeometry": "true",
+        "geometryPrecision": 4,
+        "f": "json",
     }
-    # The NETL fallback below can't replicate the primary's Pub_Access closed-access filter (see
-    # NETL_FALLBACK_WHERE), so every fallback-served tile is a strictly worse approximation --
-    # worth one retry on a short backoff before accepting that trade-off, since the primary is
-    # normally fast (sub-second) and a bare single timeout was tripping on transient blips alone.
+    # One retry on a short backoff -- the primary is normally sub-second, and a bare single
+    # timeout was tripping on transient blips alone.
     for attempt in range(2):
         try:
             resp = await http_client.get(
-                PADUS_PRIMARY_TILE_SERVICE, params=primary_params, timeout=httpx.Timeout(10.0)
+                PADUS_PRIMARY_QUERY_URL, params=primary_query_params, timeout=httpx.Timeout(10.0)
             )
-            content_type = resp.headers.get("content-type", "")
-            if resp.status_code == 200 and content_type.startswith("image/"):
-                return Response(content=resp.content, media_type=content_type, headers={"X-Tile-Source": "padus-primary"})
-        except (httpx.TimeoutException, httpx.HTTPError):
+            resp.raise_for_status()
+            data = resp.json()
+            if "error" not in data:
+                features = data.get("features") or []
+                if not features:
+                    return Response(content=_blank_tile(), media_type="image/png", headers={"X-Tile-Source": "padus-primary-empty"})
+                tile_bytes = _rasterize_netl_features(features, parsed_bbox)
+                return Response(content=tile_bytes, media_type="image/png", headers={"X-Tile-Source": "padus-primary"})
+        except (httpx.TimeoutException, httpx.HTTPError, ValueError):
             pass  # retry once, then fall through to NETL fallback below
         if attempt == 0:
             await asyncio.sleep(0.4)
 
-    xmin, ymin, xmax, ymax = parsed_bbox
     query_params = {
         "geometry": f"{xmin},{ymin},{xmax},{ymax}",
         "geometryType": "esriGeometryEnvelope",
