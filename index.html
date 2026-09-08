@@ -14,13 +14,13 @@
 <link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet" />
 <script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
 
-<link rel="stylesheet" href="./base.css?v=bf7801f5" />
-<link rel="stylesheet" href="./style.css?v=bf7801f5" />
+<link rel="stylesheet" href="./base.css?v=824bf038" />
+<link rel="stylesheet" href="./style.css?v=liveshare1" />
 
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2314120e'/%3E%3Crect x='2' y='2' width='28' height='28' rx='6' fill='none' stroke='%236a9169' stroke-width='1' opacity='0.35'/%3E%3Cpath d='M6 22l6-11 4 6 4-9 6 14' fill='none' stroke='%236a9169' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='16' cy='8' r='1.6' fill='%236a9169'/%3E%3C/svg%3E" />
 
 <link rel="manifest" href="./manifest.json" />
-<link rel="apple-touch-icon" href="./assets/icons/apple-touch-icon.png?v=bf7801f5" />
+<link rel="apple-touch-icon" href="./assets/icons/apple-touch-icon.png?v=824bf038" />
 <meta name="theme-color" content="#14120e" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
@@ -227,6 +227,26 @@
     </aside>
 
     <div class="toast-stack" id="toastStack"></div>
+
+    <div class="install-banner" id="installBanner" role="dialog" aria-live="polite" aria-label="Install EScout">
+      <div class="install-banner-icon" aria-hidden="true">
+        <svg viewBox="0 0 32 32" fill="none">
+          <rect x="1" y="1" width="30" height="30" rx="8" stroke="currentColor" stroke-width="1.6" opacity="0.35"/>
+          <path d="M6 22l6-11 4 6 4-9 6 14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+          <circle cx="16" cy="8" r="1.6" fill="currentColor"/>
+        </svg>
+      </div>
+      <div class="install-banner-body">
+        <div class="install-banner-title">Install EScout</div>
+        <div class="install-banner-desc" id="installBannerDesc">Add it to your home screen for full-screen, offline-ready access in the field.</div>
+      </div>
+      <div class="install-banner-actions">
+        <button class="btn btn-amber" id="installBannerAction" type="button">Install</button>
+        <button class="icon-btn install-banner-close" id="installBannerClose" aria-label="Dismiss install prompt" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+    </div>
   </main>
 </div>
 
@@ -275,12 +295,28 @@
       <button class="btn btn-ghost" id="manageBillingBtn" type="button" style="display:none;">Manage billing</button>
       <span id="trialNoteText">Secure payments via Stripe · cancel anytime</span>
     </div>
+    <div class="legal-links-row">
+      By subscribing you agree to our <a href="./terms.html" target="_blank" rel="noopener">Terms</a>, <a href="./privacy.html" target="_blank" rel="noopener">Privacy Policy</a>, and <a href="./refund.html" target="_blank" rel="noopener">Refund Policy</a>.
+    </div>
     <div class="redeem-row" id="redeemRow">
       <button class="link-btn" id="redeemToggle" type="button">Have a complimentary code?</button>
       <div class="redeem-form" id="redeemForm" style="display:none;">
         <input class="redeem-input" id="redeemInput" type="text" placeholder="Enter code" autocapitalize="off" autocorrect="off" spellcheck="false" />
         <button class="btn btn-ghost" id="redeemSubmit" type="button">Apply</button>
       </div>
+    </div>
+    <div class="redeem-row" id="restoreRow">
+      <button class="link-btn" id="restoreToggle" type="button">Already paid but seeing Free?</button>
+      <div class="redeem-form" id="restoreForm" style="display:none;">
+        <input class="redeem-input" id="restoreInput" type="email" placeholder="Email used at checkout" autocapitalize="off" autocorrect="off" spellcheck="false" />
+        <button class="btn btn-ghost" id="restoreSendCode" type="button">Send code</button>
+      </div>
+      <div class="redeem-form" id="restoreCodeForm" style="display:none;">
+        <input class="redeem-input" id="restoreCodeInput" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="6-digit code" autocapitalize="off" autocorrect="off" spellcheck="false" />
+        <button class="btn btn-ghost" id="restoreSubmit" type="button">Verify &amp; restore</button>
+      </div>
+      <p class="redeem-hint" id="restoreHint">Installing the app more than once (or opening it in a different browser) can create a separate, unpaid copy on this device. Enter the email you paid with and we'll send a code to verify it's yours.</p>
+      <button class="link-btn" id="restoreResend" type="button" style="display:none;">Resend code</button>
     </div>
   </div>
 </div>
@@ -342,10 +378,14 @@
       <input type="text" id="shareLinkInput" readonly aria-label="Shareable pin link" />
       <button class="btn btn-amber" id="shareCopyBtn" type="button">Copy link</button>
     </div>
-    <p class="share-modal-hint">Anyone who opens this link gets their own copy of these pins added to their map — your originals aren't affected.</p>
+    <p class="share-modal-hint">Anyone who opens this link gets a live, view-only copy on their map that updates whenever you move or edit yours — they can't edit, delete, or re-share it. Revoke access for anyone below, any time.</p>
+    <div class="share-access-section" id="shareAccessSection" style="display:none;">
+      <div class="share-access-heading">People with access</div>
+      <ul class="share-access-list" id="shareAccessList"></ul>
+    </div>
   </div>
 </div>
 
-<script src="./app.js?v=bf7801f5"></script>
+<script src="./app.js?v=liveshare1"></script>
 </body>
 </html>
