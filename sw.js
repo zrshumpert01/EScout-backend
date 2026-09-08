@@ -2,7 +2,7 @@
    native app. Live data (land cover, elevation, wind, parcels, geocoding, map tiles) is
    never cached here — those requests always go straight to the network so Scout AI keeps
    reading real, current data. */
-const CACHE_NAME = 'escout-shell-vliveshare1';
+const CACHE_NAME = 'escout-shell-vliveshare2';
 const SHELL_FILES = [
   './',
   './index.html',
