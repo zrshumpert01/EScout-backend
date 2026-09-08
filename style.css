@@ -1342,11 +1342,24 @@ body {
   place-items: center;
   cursor: pointer;
   filter: drop-shadow(0 3px 6px rgba(0, 0, 0, 0.5));
+}
+.escout-marker svg {
+  width: 100%;
+  height: 100%;
+}
+/* Positioning effects (like the shared-pin badge) go on this inner wrapper, never on
+   .escout-marker itself — see note above about MapLibre owning that element's transform. */
+.marker-pop {
   position: relative;
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  animation: marker-pop-in 420ms var(--ease-signature) both;
 }
 /* A pin someone else shared with you (live, view-only) gets a small dot badge so it reads
    as "not fully yours" at a glance, without changing the pin-type glyph itself. */
-.escout-marker.shared-pin::after {
+.escout-marker.shared-pin .marker-pop::after {
   content: '';
   position: absolute;
   top: -1px;
@@ -1357,17 +1370,6 @@ body {
   background: var(--color-primary);
   border: 2px solid var(--color-bg);
   z-index: 1;
-}
-.escout-marker svg {
-  width: 100%;
-  height: 100%;
-}
-.marker-pop {
-  display: grid;
-  place-items: center;
-  width: 100%;
-  height: 100%;
-  animation: marker-pop-in 420ms var(--ease-signature) both;
 }
 @keyframes marker-pop-in {
   0% {
