@@ -1216,8 +1216,12 @@ async def get_view_state(request: Request):
     return {"lng": r["lng"], "lat": r["lat"], "zoom": r["zoom"]}
 
 
-@app.put("/api/view-state")
+@app.api_route("/api/view-state", methods=["PUT", "POST"])
 async def save_view_state(body: ViewStateBody, request: Request):
+    # POST is accepted alongside PUT solely so the frontend can flush the last map
+    # position via navigator.sendBeacon() when the tab is being backgrounded/closed —
+    # sendBeacon only ever sends POST and can't set a custom method. See the
+    # visibilitychange/pagehide handlers in app.js.
     await rate_limit(f"view-state:{client_ip(request)}", limit=60, window_seconds=60)
     vid = request.state.vid
     now = int(time.time())
