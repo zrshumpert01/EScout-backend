@@ -1681,9 +1681,11 @@ async def private_roads(bbox: str):
         resp = await http_client.post(OVERPASS_URL, data={"data": query}, timeout=httpx.Timeout(15.0))
         resp.raise_for_status()
         data = resp.json()
-    except Exception:
+        print(f"[private-roads DEBUG] query={query!r} status={resp.status_code} elements={len(data.get('elements', []))}")
+    except Exception as exc:
         # Serve a stale cache entry over a hard failure if we have one; otherwise degrade to
         # empty rather than a 500 that would surface as a map error.
+        print(f"[private-roads DEBUG] EXCEPTION query={query!r} err={exc!r}")
         if cached:
             return JSONResponse(cached[1])
         return JSONResponse({"type": "FeatureCollection", "features": []})
