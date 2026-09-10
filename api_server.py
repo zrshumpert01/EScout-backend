@@ -1637,7 +1637,11 @@ async def usace_land_tile(bbox: str):
 # in-memory (not Supabase) on purpose: it's a load-shedding measure, not data of record, so
 # losing it on every redeploy is fine -- it just lazily rebuilds.
 # ---------------------------------------------------------------------------------------
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_URLS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+]
 PRIVATE_ROADS_CACHE_TTL = 6 * 3600
 PRIVATE_ROADS_CACHE_MAX_ENTRIES = 500
 PRIVATE_ROADS_GRID_DEG = 0.05  # ~5.5km at this latitude -- coarse enough for real cache reuse
@@ -1677,24 +1681,32 @@ async def private_roads(bbox: str):
 
     w2, s2, e2, n2 = (float(v) for v in cell_key.split(","))
     query = f'[out:json][timeout:15];way["access"="private"]["highway"]({s2},{w2},{n2},{e2});out geom;'
-    try:
-        resp = await http_client.post(
-            OVERPASS_URL,
-            data={"data": query},
-            timeout=httpx.Timeout(15.0),
-            headers={
-                "User-Agent": "EScoutHuntingApp/1.0 (https://escouthunt.com; contact via app)",
-                "Accept": "application/json, text/plain, */*",
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        print(f"[private-roads DEBUG] query={query!r} status={resp.status_code} elements={len(data.get('elements', []))}")
-    except Exception as exc:
-        # Serve a stale cache entry over a hard failure if we have one; otherwise degrade to
-        # empty rather than a 500 that would surface as a map error.
-        print(f"[private-roads DEBUG] EXCEPTION query={query!r} err={exc!r}")
+    data = None
+    last_exc = None
+    for mirror_url in OVERPASS_URLS:
+        try:
+            resp = await http_client.post(
+                mirror_url,
+                data={"data": query},
+                timeout=httpx.Timeout(15.0),
+                headers={
+                    "User-Agent": "EScoutHuntingApp/1.0 (https://escouthunt.com; contact via app)",
+                    "Accept": "application/json, text/plain, */*",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            print(f"[private-roads DEBUG] mirror={mirror_url} query={query!r} status={resp.status_code} elements={len(data.get('elements', []))}")
+            break
+        except Exception as exc:
+            last_exc = exc
+            print(f"[private-roads DEBUG] mirror={mirror_url} EXCEPTION query={query!r} err={exc!r}")
+            continue
+    if data is None:
+        # Every mirror failed. Serve a stale cache entry over a hard failure if we have one;
+        # otherwise degrade to empty rather than a 500 that would surface as a map error.
+        print(f"[private-roads DEBUG] ALL MIRRORS FAILED query={query!r} last_err={last_exc!r}")
         if cached:
             return JSONResponse(cached[1])
         return JSONResponse({"type": "FeatureCollection", "features": []})
