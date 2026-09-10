@@ -29,6 +29,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import os
 import secrets
 import time
@@ -1615,6 +1616,101 @@ async def usace_land_tile(bbox: str):
     except (httpx.TimeoutException, httpx.HTTPError):
         pass
     return Response(content=_blank_tile(), media_type="image/png", headers={"X-Tile-Source": "none-error"})
+
+
+# ---------------------------------------------------------------------------------------
+# Private roads (OpenStreetMap access=private ways) -- the standard Esri road raster layer
+# (see escout-roads in app.js) has NO attribute data at all, so it can never distinguish a
+# private track from a public one, and Esri's dataset simply omits many private tracks and
+# driveways outright (confirmed: the Cedar Grove Rd spur in Starkville, MS, OSM way 13679731,
+# renders zero pixels at any zoom in the Esri layer). OSM is the only source in this app with
+# real access-tag data, so this is a genuinely new data source, queried live from Overpass
+# rather than pre-bundled, since OSM's private-road tagging is edited constantly and a stale
+# snapshot would both miss new tags and keep showing roads whose access has since changed.
+#
+# Overpass has a real fair-use/rate-limit policy, and this app has no control over how many
+# concurrent visitors pan the map at once -- so unlike the PAD-US/USACE tile endpoints above
+# (which re-query their source on every single request), this endpoint snaps every request to
+# a coarse ~0.05-degree grid cell and caches the resulting GeoJSON in memory for several hours.
+# That means many different visitors panning around the same county, or one visitor panning
+# back and forth, mostly hit the in-process cache instead of Overpass. The cache is plain
+# in-memory (not Supabase) on purpose: it's a load-shedding measure, not data of record, so
+# losing it on every redeploy is fine -- it just lazily rebuilds.
+# ---------------------------------------------------------------------------------------
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+PRIVATE_ROADS_CACHE_TTL = 6 * 3600
+PRIVATE_ROADS_CACHE_MAX_ENTRIES = 500
+PRIVATE_ROADS_GRID_DEG = 0.05  # ~5.5km at this latitude -- coarse enough for real cache reuse
+PRIVATE_ROADS_MAX_SPAN_DEG = 1.0  # refuse absurdly large bbox requests (whole-state, etc.)
+_private_roads_cache: dict[str, tuple[float, dict]] = {}  # cell key -> (expires_at, geojson)
+
+
+def _snap_bbox_to_grid(west: float, south: float, east: float, north: float) -> str:
+    g = PRIVATE_ROADS_GRID_DEG
+    w = math.floor(west / g) * g
+    s = math.floor(south / g) * g
+    e = math.ceil(east / g) * g
+    n = math.ceil(north / g) * g
+    return f"{w:.4f},{s:.4f},{e:.4f},{n:.4f}"
+
+
+@app.get("/api/private-roads")
+async def private_roads(bbox: str):
+    """Returns a GeoJSON FeatureCollection of OSM ways tagged access=private within (a grid
+    cell covering) the requested lon/lat bbox `west,south,east,north`. Always returns 200 with
+    a (possibly empty, possibly stale-cached) FeatureCollection -- an Overpass outage should
+    degrade to "no private roads shown this pan", never a broken map or console error, same
+    philosophy as the PAD-US/USACE tile endpoints above.
+    """
+    try:
+        west, south, east, north = _parse_bbox(bbox)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid bbox")
+    if (east - west) > PRIVATE_ROADS_MAX_SPAN_DEG or (north - south) > PRIVATE_ROADS_MAX_SPAN_DEG:
+        raise HTTPException(status_code=400, detail="bbox too large")
+
+    cell_key = _snap_bbox_to_grid(west, south, east, north)
+    now = time.time()
+    cached = _private_roads_cache.get(cell_key)
+    if cached and cached[0] > now:
+        return JSONResponse(cached[1])
+
+    w2, s2, e2, n2 = (float(v) for v in cell_key.split(","))
+    query = f'[out:json][timeout:15];way["access"="private"]["highway"]({s2},{w2},{n2},{e2});out geom;'
+    try:
+        resp = await http_client.post(OVERPASS_URL, data={"data": query}, timeout=httpx.Timeout(15.0))
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        # Serve a stale cache entry over a hard failure if we have one; otherwise degrade to
+        # empty rather than a 500 that would surface as a map error.
+        if cached:
+            return JSONResponse(cached[1])
+        return JSONResponse({"type": "FeatureCollection", "features": []})
+
+    features = []
+    for el in data.get("elements", []):
+        if el.get("type") != "way":
+            continue
+        geom = el.get("geometry") or []
+        if len(geom) < 2:
+            continue
+        coords = [[pt["lon"], pt["lat"]] for pt in geom if pt]
+        if len(coords) < 2:
+            continue
+        tags = el.get("tags", {})
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "LineString", "coordinates": coords},
+            "properties": {"name": tags.get("name") or "Private Road", "highway": tags.get("highway", "")},
+        })
+    geojson = {"type": "FeatureCollection", "features": features}
+
+    if len(_private_roads_cache) >= PRIVATE_ROADS_CACHE_MAX_ENTRIES:
+        oldest_key = min(_private_roads_cache, key=lambda k: _private_roads_cache[k][0])
+        _private_roads_cache.pop(oldest_key, None)
+    _private_roads_cache[cell_key] = (now + PRIVATE_ROADS_CACHE_TTL, geojson)
+    return JSONResponse(geojson)
 
 
 if __name__ == "__main__":
