@@ -692,6 +692,61 @@ async def delete_grant(code: str, x_admin_key: str | None = Header(default=None)
     return {"deleted": True}
 
 
+# ------------------------------------------------------------------------------------------
+# Share-banner campaign — a lightweight, owner-controlled promo: a "Love the app? Share it
+# with a friend!" banner shown to every visitor for a 5-day window. This is a single global
+# on/off switch (not per-visitor), stored in the generic `app_settings` key/value table so it
+# persists across redeploys and this sandbox restarting. The owner starts/stops it from
+# /admin.html; the frontend just calls the public GET below on each app load to know whether
+# to show the banner and flash the Share button.
+# ------------------------------------------------------------------------------------------
+SHARE_BANNER_DURATION_DAYS = 5
+SHARE_BANNER_SETTING_KEY = "share_banner_campaign"
+
+
+async def _get_share_banner_started_at() -> int | None:
+    res = await supabase.table("app_settings").select("value").eq("key", SHARE_BANNER_SETTING_KEY).limit(1).execute()
+    if not res.data:
+        return None
+    value = res.data[0]["value"] or {}
+    return value.get("started_at")
+
+
+def _share_banner_status(started_at: int | None) -> dict:
+    now = int(time.time())
+    ends_at = (started_at + SHARE_BANNER_DURATION_DAYS * SECONDS_PER_DAY) if started_at else None
+    active = bool(started_at and ends_at and now < ends_at)
+    return {"active": active, "startedAt": started_at, "endsAt": ends_at}
+
+
+@app.get("/api/share-banner")
+async def get_share_banner():
+    started_at = await _get_share_banner_started_at()
+    return _share_banner_status(started_at)
+
+
+@app.post("/api/admin/share-banner/start")
+async def start_share_banner(x_admin_key: str | None = Header(default=None)):
+    require_admin(x_admin_key)
+    now = int(time.time())
+    await supabase.table("app_settings").upsert(
+        {"key": SHARE_BANNER_SETTING_KEY, "value": {"started_at": now}, "updated_at": now},
+        on_conflict="key",
+    ).execute()
+    return _share_banner_status(now)
+
+
+@app.post("/api/admin/share-banner/stop")
+async def stop_share_banner(x_admin_key: str | None = Header(default=None)):
+    require_admin(x_admin_key)
+    now = int(time.time())
+    await supabase.table("app_settings").upsert(
+        {"key": SHARE_BANNER_SETTING_KEY, "value": {"started_at": None}, "updated_at": now},
+        on_conflict="key",
+    ).execute()
+    return _share_banner_status(None)
+
+
 class RedeemBody(BaseModel):
     code: str
 
