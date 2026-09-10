@@ -1678,7 +1678,16 @@ async def private_roads(bbox: str):
     w2, s2, e2, n2 = (float(v) for v in cell_key.split(","))
     query = f'[out:json][timeout:15];way["access"="private"]["highway"]({s2},{w2},{n2},{e2});out geom;'
     try:
-        resp = await http_client.post(OVERPASS_URL, data={"data": query}, timeout=httpx.Timeout(15.0))
+        resp = await http_client.post(
+            OVERPASS_URL,
+            data={"data": query},
+            timeout=httpx.Timeout(15.0),
+            headers={
+                "User-Agent": "EScoutHuntingApp/1.0 (https://escouthunt.com; contact via app)",
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
         resp.raise_for_status()
         data = resp.json()
         print(f"[private-roads DEBUG] query={query!r} status={resp.status_code} elements={len(data.get('elements', []))}")
