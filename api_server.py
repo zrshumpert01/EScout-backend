@@ -1665,6 +1665,13 @@ async def private_roads(bbox: str):
     a (possibly empty, possibly stale-cached) FeatureCollection -- an Overpass outage should
     degrade to "no private roads shown this pan", never a broken map or console error, same
     philosophy as the PAD-US/USACE tile endpoints above.
+
+    NOTE (paused): public Overpass instances consistently refuse/timeout requests from this
+    host's IP range (verified against overpass-api.de, overpass.kumi.systems, and
+    overpass.private.coffee), so this always degrades to an empty FeatureCollection today. Left
+    deployed but unused by the frontend -- the "Private Roads & Driveways" layer toggle is
+    hidden from LAYER_DEFS in app.js until a reliable data path (paid Overpass tier, or a
+    pre-fetched static extract) is in place.
     """
     try:
         west, south, east, north = _parse_bbox(bbox)
@@ -1697,16 +1704,14 @@ async def private_roads(bbox: str):
             )
             resp.raise_for_status()
             data = resp.json()
-            print(f"[private-roads DEBUG] mirror={mirror_url} query={query!r} status={resp.status_code} elements={len(data.get('elements', []))}")
             break
         except Exception as exc:
             last_exc = exc
-            print(f"[private-roads DEBUG] mirror={mirror_url} EXCEPTION query={query!r} err={exc!r}")
             continue
     if data is None:
-        # Every mirror failed. Serve a stale cache entry over a hard failure if we have one;
-        # otherwise degrade to empty rather than a 500 that would surface as a map error.
-        print(f"[private-roads DEBUG] ALL MIRRORS FAILED query={query!r} last_err={last_exc!r}")
+        # Every mirror failed (currently always the case -- see NOTE above). Serve a stale
+        # cache entry over a hard failure if we have one; otherwise degrade to empty rather
+        # than a 500 that would surface as a map error.
         if cached:
             return JSONResponse(cached[1])
         return JSONResponse({"type": "FeatureCollection", "features": []})
