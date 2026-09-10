@@ -142,6 +142,16 @@
         <div class="empty-note">Loading…</div>
       </div>
     </div>
+
+    <div class="card">
+      <h2>Share banner campaign</h2>
+      <p class="admin-sub" style="margin-bottom: var(--space-4);">Shows a "Love the app? Share it with a friend!" banner to every visitor, with the Share button flashing, for 5 days. Turns itself off automatically after that — start it again here whenever you want another push.</p>
+      <div id="bannerStatusWrap" class="empty-note">Loading…</div>
+      <div style="display:flex; gap: var(--space-3); margin-top: var(--space-4); flex-wrap: wrap;">
+        <button class="btn-primary-admin" id="startBannerBtn">Start 5-day campaign</button>
+        <button class="btn-danger-admin" id="stopBannerBtn" style="display:none;">Stop now</button>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -149,9 +159,7 @@
 
 <script>
 (function () {
-  // Same placeholder pattern as app.js — publish_website rewrites __PORT_8000__ to the
-  // correct /port/8000 routing prefix on the live site; falls back to localhost for local dev.
-  const API = '__PORT_8000__'.startsWith('__') ? 'http://localhost:8000' : '__PORT_8000__';
+  const API = 'https://escout-backend.onrender.com';
 
   const gateScreen = document.getElementById('gateScreen');
   const mainScreen = document.getElementById('mainScreen');
@@ -201,6 +209,7 @@
     gateScreen.style.display = 'none';
     mainScreen.style.display = 'block';
     loadGrants();
+    loadBannerStatus();
   }
 
   function statusBadge(status) {
@@ -295,6 +304,55 @@
       if (e.message !== 'unauthorized') toast(e.message || 'Could not delete code');
     }
   }
+
+  function fmtDateTime(ts) {
+    if (!ts) return '—';
+    return new Date(ts * 1000).toLocaleString();
+  }
+
+  async function loadBannerStatus() {
+    const wrap = document.getElementById('bannerStatusWrap');
+    const startBtn = document.getElementById('startBannerBtn');
+    const stopBtn = document.getElementById('stopBannerBtn');
+    try {
+      const data = await adminFetch('/api/share-banner');
+      if (data.active) {
+        wrap.innerHTML = `<span class="badge active">Active</span> &nbsp;runs until ${fmtDateTime(data.endsAt)}`;
+        startBtn.textContent = 'Restart 5-day campaign';
+        stopBtn.style.display = '';
+      } else {
+        wrap.innerHTML = data.startedAt
+          ? `<span class="badge expired">Ended</span> &nbsp;last ran until ${fmtDateTime(data.endsAt)}`
+          : '<span class="badge pending">Never run</span>';
+        startBtn.textContent = 'Start 5-day campaign';
+        stopBtn.style.display = 'none';
+      }
+    } catch (e) {
+      if (e.message !== 'unauthorized') wrap.innerHTML = `Could not load status — ${escapeHtml(e.message)}`;
+    }
+  }
+
+  document.getElementById('startBannerBtn').addEventListener('click', async () => {
+    if (!confirm('Show the share banner (with the Share button flashing) to every visitor for the next 5 days?')) return;
+    try {
+      await adminFetch('/api/admin/share-banner/start', { method: 'POST' });
+      toast('Share banner campaign started');
+      loadBannerStatus();
+    } catch (e) {
+      if (e.message !== 'unauthorized') toast(e.message || 'Could not start campaign');
+    }
+  });
+
+  document.getElementById('stopBannerBtn').addEventListener('click', async () => {
+    if (!confirm('Stop the share banner campaign now?')) return;
+    try {
+      await adminFetch('/api/admin/share-banner/stop', { method: 'POST' });
+      toast('Share banner campaign stopped');
+      loadBannerStatus();
+    } catch (e) {
+      if (e.message !== 'unauthorized') toast(e.message || 'Could not stop campaign');
+    }
+  });
 
   unlockBtn.addEventListener('click', async () => {
     const key = adminKeyInput.value.trim();
