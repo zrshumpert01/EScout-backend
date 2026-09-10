@@ -683,13 +683,29 @@ async def revoke_grant(code: str, x_admin_key: str | None = Header(default=None)
 @app.delete("/api/admin/grants/{code}")
 async def delete_grant(code: str, x_admin_key: str | None = Header(default=None)):
     require_admin(x_admin_key)
-    res = await supabase.table("comp_grants").select("redeemed_at").eq("code", code).limit(1).execute()
+    res = await supabase.table("comp_grants").select("*").eq("code", code).limit(1).execute()
     if not res.data:
         raise HTTPException(404, "Grant not found")
-    if res.data[0]["redeemed_at"]:
-        raise HTTPException(400, "Grant already redeemed — revoke it instead of deleting")
+    row = res.data[0]
+    status = _grant_dict(row)["status"]
+    # Pending (never redeemed) codes are always safe to delete. Revoked and expired grants are
+    # also safe — the person's access was already cut off (revoke) or lapsed on its own
+    # (expiry), so deleting the record can't grant or extend anyone's access. Active grants are
+    # never deletable this way — revoke first.
+    if status == "active":
+        raise HTTPException(400, "Grant is still active — revoke it instead of deleting")
     await supabase.table("comp_grants").delete().eq("code", code).execute()
     return {"deleted": True}
+
+
+@app.post("/api/admin/grants/clear-old")
+async def clear_old_grants(x_admin_key: str | None = Header(default=None)):
+    require_admin(x_admin_key)
+    res = await supabase.table("comp_grants").select("*").execute()
+    to_delete = [r["code"] for r in res.data if _grant_dict(r)["status"] in ("revoked", "expired")]
+    for code in to_delete:
+        await supabase.table("comp_grants").delete().eq("code", code).execute()
+    return {"deleted": len(to_delete)}
 
 
 # ------------------------------------------------------------------------------------------
