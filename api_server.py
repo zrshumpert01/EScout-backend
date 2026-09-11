@@ -156,7 +156,9 @@ def _load_or_create_admin_key_from_file() -> str:
 ADMIN_KEY = _load_or_create_admin_key()
 _admin_key_source = "ADMIN_KEY env var (persists across redeploys)" if os.environ.get("ADMIN_KEY", "").strip() else "generated admin_key.txt (will rotate on next redeploy — set ADMIN_KEY env var to persist it)"
 print(f"[escout] Admin key source: {_admin_key_source}", flush=True)
-print(f"[escout] Admin key (for /admin.html — keep private): {ADMIN_KEY}", flush=True)
+# NOTE: the key itself is intentionally never printed -- Render's log viewer is not a secure
+# place to display it. Look it up directly in the Render dashboard's ADMIN_KEY env var, or in
+# admin_key.txt on disk for the generated-fallback path.
 
 
 def require_admin(x_admin_key: str | None):
@@ -1436,6 +1438,49 @@ PADUS_OUTLINE_RGBA = (57, 255, 20, 210)
 TILE_SIZE = 256
 _TRANSPARENT_TILE = None  # lazily built once, see _blank_tile()
 
+# In-memory cache for the rasterized/proxied public-land and USACE tiles. Map tile bboxes are
+# deterministic per zoom/x/y, so panning back over an already-seen tile produces the exact same
+# bbox string -- an exact-match cache (no grid-snapping needed, unlike private-roads' arbitrary
+# viewport bboxes) gets very high hit rates for normal pan/zoom use. This matters for memory, not
+# just speed: every uncached request allocates several full 1024x1024 RGBA buffers (see
+# _rasterize_netl_features) and re-queries the upstream service, so a burst of concurrent
+# requests from fast panning was observed to spike the backend past its memory limit and get
+# OOM-killed. Caching means repeat pans over the same area hit these dicts instead of
+# re-fetching and re-rendering. "Confirmed empty/rendered" results are cached normally; total
+# upstream failures are NOT cached, so a transient outage doesn't get stuck serving blank tiles
+# long after the upstream recovers.
+TILE_CACHE_TTL = 24 * 3600
+TILE_CACHE_MAX_ENTRIES = 4000
+_public_land_tile_cache: dict[str, tuple[float, bytes, str]] = {}  # bbox -> (expires_at, png_bytes, source)
+_usace_tile_cache: dict[str, tuple[float, bytes, str]] = {}
+
+
+def _tile_cache_get(cache: dict[str, tuple[float, bytes, str]], key: str) -> tuple[bytes, str] | None:
+    entry = cache.get(key)
+    if entry is None:
+        return None
+    expires_at, data, source = entry
+    if expires_at <= time.time():
+        cache.pop(key, None)
+        return None
+    return data, source
+
+
+def _tile_cache_set(cache: dict[str, tuple[float, bytes, str]], key: str, data: bytes, source: str) -> None:
+    if len(cache) >= TILE_CACHE_MAX_ENTRIES:
+        now = time.time()
+        for k in [k for k, v in cache.items() if v[0] <= now]:
+            cache.pop(k, None)
+        while len(cache) >= TILE_CACHE_MAX_ENTRIES:
+            cache.pop(next(iter(cache)), None)  # evict oldest inserted
+    cache[key] = (time.time() + TILE_CACHE_TTL, data, source)
+
+
+def _cache_and_respond(cache: dict[str, tuple[float, bytes, str]], key: str, data: bytes, source: str) -> Response:
+    """Store a confirmed (non-error) tile result in `cache` and return it as a PNG response."""
+    _tile_cache_set(cache, key, data, source)
+    return Response(content=data, media_type="image/png", headers={"X-Tile-Source": source})
+
 
 def _blank_tile() -> bytes:
     global _TRANSPARENT_TILE
@@ -1520,6 +1565,11 @@ async def public_land_tile(bbox: str):
     except ValueError:
         raise HTTPException(status_code=400, detail="invalid bbox")
 
+    cached = _tile_cache_get(_public_land_tile_cache, bbox)
+    if cached is not None:
+        data, source = cached
+        return Response(content=data, media_type="image/png", headers={"X-Tile-Source": f"{source}-cached"})
+
     xmin, ymin, xmax, ymax = parsed_bbox
     primary_query_params = {
         "geometry": f"{xmin},{ymin},{xmax},{ymax}",
@@ -1545,9 +1595,9 @@ async def public_land_tile(bbox: str):
             if "error" not in data:
                 features = data.get("features") or []
                 if not features:
-                    return Response(content=_blank_tile(), media_type="image/png", headers={"X-Tile-Source": "padus-primary-empty"})
+                    return _cache_and_respond(_public_land_tile_cache, bbox, _blank_tile(), "padus-primary-empty")
                 tile_bytes = _rasterize_netl_features(features, parsed_bbox)
-                return Response(content=tile_bytes, media_type="image/png", headers={"X-Tile-Source": "padus-primary"})
+                return _cache_and_respond(_public_land_tile_cache, bbox, tile_bytes, "padus-primary")
         except (httpx.TimeoutException, httpx.HTTPError, ValueError):
             pass  # retry once, then fall through to NETL fallback below
         if attempt == 0:
@@ -1571,12 +1621,13 @@ async def public_land_tile(bbox: str):
         data = resp.json()
         features = data.get("features") or []
         if not features:
-            return Response(content=_blank_tile(), media_type="image/png", headers={"X-Tile-Source": "none-empty"})
+            return _cache_and_respond(_public_land_tile_cache, bbox, _blank_tile(), "none-empty")
         tile_bytes = _rasterize_netl_features(features, parsed_bbox)
-        return Response(content=tile_bytes, media_type="image/png", headers={"X-Tile-Source": "netl-fallback"})
+        return _cache_and_respond(_public_land_tile_cache, bbox, tile_bytes, "netl-fallback")
     except Exception:
         # Both sources failed -- degrade to a blank tile rather than a broken image or a
-        # 500 that would surface as a map error to the user.
+        # 500 that would surface as a map error to the user. Deliberately NOT cached: a
+        # transient upstream outage shouldn't get stuck serving blank tiles after it recovers.
         return Response(content=_blank_tile(), media_type="image/png", headers={"X-Tile-Source": "none-error"})
 
 
@@ -1597,6 +1648,11 @@ async def usace_land_tile(bbox: str):
     except ValueError:
         raise HTTPException(status_code=400, detail="invalid bbox")
 
+    cached = _tile_cache_get(_usace_tile_cache, bbox)
+    if cached is not None:
+        data, source = cached
+        return Response(content=data, media_type="image/png", headers={"X-Tile-Source": f"{source}-cached"})
+
     params = {
         "bbox": bbox,
         "bboxSR": 3857,
@@ -1612,9 +1668,11 @@ async def usace_land_tile(bbox: str):
         resp = await http_client.get(USACE_CWLDM_TILE_SERVICE, params=params, timeout=httpx.Timeout(8.0))
         content_type = resp.headers.get("content-type", "")
         if resp.status_code == 200 and content_type.startswith("image/"):
+            _tile_cache_set(_usace_tile_cache, bbox, resp.content, "usace-direct")
             return Response(content=resp.content, media_type=content_type, headers={"X-Tile-Source": "usace-direct"})
     except (httpx.TimeoutException, httpx.HTTPError):
         pass
+    # Not cached -- a transient upstream failure shouldn't get stuck serving blank tiles.
     return Response(content=_blank_tile(), media_type="image/png", headers={"X-Tile-Source": "none-error"})
 
 
