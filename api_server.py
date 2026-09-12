@@ -610,6 +610,11 @@ async def stripe_webhook(request: Request):
 class CreateGrantBody(BaseModel):
     label: str | None = None
     duration_days: int = 365
+    # Required (unlike label) — it's the only way this person can ever recover Premium later
+    # via /api/restore/* if their visitor id gets orphaned (new device, storage wipe, reinstall
+    # after an app update). Grants created before this field existed have no email and simply
+    # aren't restorable by email — only a fresh grant fixes that for them.
+    email: str
 
 
 def _grant_dict(row: dict) -> dict:
@@ -632,6 +637,7 @@ def _grant_dict(row: dict) -> dict:
     return {
         "code": code,
         "label": label,
+        "email": row.get("email"),
         "tier": tier,
         "durationDays": duration_days,
         "createdAt": created_at,
@@ -650,10 +656,20 @@ async def create_grant(body: CreateGrantBody, x_admin_key: str | None = Header(d
     # state assignment too, which the redemption flow doesn't collect, so it's not offered.
     if body.duration_days < 1 or body.duration_days > 3650:
         raise HTTPException(400, "duration_days must be between 1 and 3650")
+    email = (body.email or "").strip().lower()
+    if not email or "@" not in email or len(email) > 254:
+        raise HTTPException(400, "Enter the recipient's email so they can restore access later if needed")
     code = secrets.token_urlsafe(9)
     now = int(time.time())
     await supabase.table("comp_grants").insert(
-        {"code": code, "label": body.label, "tier": "premium", "duration_days": body.duration_days, "created_at": now}
+        {
+            "code": code,
+            "label": body.label,
+            "email": email,
+            "tier": "premium",
+            "duration_days": body.duration_days,
+            "created_at": now,
+        }
     ).execute()
     return {"code": code}
 
@@ -905,6 +921,36 @@ async def _find_active_subscription_by_email(email: str) -> tuple[str, dict] | N
     return best_customer_id, best_sub
 
 
+async def _find_active_comp_grant_by_email(email: str) -> dict | None:
+    # Mirrors _find_active_subscription_by_email's job but for owner-issued comp grants
+    # (see the comp grants section above) instead of Stripe. Only grants created with an
+    # email on file are matched — older grants (created before that field existed) simply
+    # aren't reachable this way. A person could in principle have been granted more than once
+    # over time (renewal, replacement code), so pick whichever redeemed, non-revoked grant has
+    # the furthest-out expiry rather than assuming there's exactly one row.
+    res = (
+        await supabase.table("comp_grants")
+        .select("code,tier,duration_days,redeemed_at,revoked_at")
+        .eq("email", email)
+        .execute()
+    )
+    now = int(time.time())
+    best = None
+    best_expires_at = None
+    for row in res.data:
+        if row.get("revoked_at") or not row.get("redeemed_at"):
+            continue
+        expires_at = row["redeemed_at"] + row["duration_days"] * SECONDS_PER_DAY
+        if expires_at <= now:
+            continue
+        if best is None or expires_at > best_expires_at:
+            best = row
+            best_expires_at = expires_at
+    if not best:
+        return None
+    return {"code": best["code"], "tier": best["tier"], "expires_at": best_expires_at}
+
+
 @app.post("/api/restore/request")
 async def restore_request(body: RestoreBody, request: Request):
     # Step 1 of Restore Purchase: send a one-time code to the typed email before restoring
@@ -985,24 +1031,49 @@ async def restore_confirm(body: RestoreConfirmBody, request: Request):
     )
 
     found = await _find_active_subscription_by_email(email)
-    if not found:
-        # Safe to be specific now — the caller already proved they own this inbox, so this
-        # can't be used to probe which emails have paid.
-        raise HTTPException(404, "No active subscription found for that email")
-    best_customer_id, best_sub = found
+    if found:
+        best_customer_id, best_sub = found
+        await upsert_row(
+            vid,
+            stripe_customer_id=best_customer_id,
+            stripe_subscription_id=best_sub["id"],
+            tier="premium",
+            state=None,
+            status=best_sub.get("status"),
+            current_period_end=best_sub.get("current_period_end"),
+            source="stripe",
+            comp_code=None,
+        )
+        return {"restored": True, "tier": "premium", "status": best_sub.get("status")}
 
+    # No paid subscription — check for a complimentary (comp) grant on file for this email
+    # before giving up. This is what lets a comp'd member (a friend/family free-access grant,
+    # not a Stripe customer) recover Premium the same way a paying subscriber does, if their
+    # visitor id ever gets orphaned (new device, storage wipe, reinstall after an app update).
+    comp = await _find_active_comp_grant_by_email(email)
+    if not comp:
+        # Safe to be specific now — the caller already proved they own this inbox, so this
+        # can't be used to probe which emails have paid or been granted access.
+        raise HTTPException(404, "No active subscription or complimentary access found for that email")
+
+    # Re-point the grant at this device/visitor id, same as how a fresh redemption works — the
+    # original expiry is preserved, this doesn't grant any extra time.
+    await (
+        supabase.table("comp_grants")
+        .update({"redeemed_visitor_id": vid})
+        .eq("code", comp["code"])
+        .execute()
+    )
     await upsert_row(
         vid,
-        stripe_customer_id=best_customer_id,
-        stripe_subscription_id=best_sub["id"],
-        tier="premium",
+        tier=comp["tier"],
         state=None,
-        status=best_sub.get("status"),
-        current_period_end=best_sub.get("current_period_end"),
-        source="stripe",
-        comp_code=None,
+        status="comp_active",
+        current_period_end=comp["expires_at"],
+        source="comp",
+        comp_code=comp["code"],
     )
-    return {"restored": True, "tier": "premium", "status": best_sub.get("status")}
+    return {"restored": True, "tier": comp["tier"], "status": "comp_active"}
 
 
 # ------------------------------------------------------------------------------------------
@@ -1454,19 +1525,6 @@ TILE_CACHE_MAX_ENTRIES = 4000
 _public_land_tile_cache: dict[str, tuple[float, bytes, str]] = {}  # bbox -> (expires_at, png_bytes, source)
 _usace_tile_cache: dict[str, tuple[float, bytes, str]] = {}
 
-# The Sept 11 OOM kill recurred even after the cache above shipped: cache hits avoid re-
-# rendering, but a burst of *first-time* pans (new area, cache miss on every tile) still fires
-# many concurrent _rasterize_netl_features() calls, and each one allocates several full
-# 1024x1024 (4x-supersampled) RGBA buffers (fill_layer, outline_layer, per-ring/per-feature
-# masks, composited) -- roughly 20-30MB of transient Pillow buffers per in-flight render. With
-# no cap, a fast-panning burst across new territory can stack up enough concurrent renders to
-# exceed the 512Mi instance limit regardless of caching. This semaphore bounds how many
-# rasterizations run at once (per worker); anything beyond the limit just waits its turn
-# instead of piling up more concurrent buffers. Deliberately generous enough to not bottleneck
-# normal use, tight enough to cap worst-case memory.
-_RASTERIZE_CONCURRENCY = 3
-_rasterize_semaphore = asyncio.Semaphore(_RASTERIZE_CONCURRENCY)
-
 
 def _tile_cache_get(cache: dict[str, tuple[float, bytes, str]], key: str) -> tuple[bytes, str] | None:
     entry = cache.get(key)
@@ -1609,8 +1667,7 @@ async def public_land_tile(bbox: str):
                 features = data.get("features") or []
                 if not features:
                     return _cache_and_respond(_public_land_tile_cache, bbox, _blank_tile(), "padus-primary-empty")
-                async with _rasterize_semaphore:
-                    tile_bytes = _rasterize_netl_features(features, parsed_bbox)
+                tile_bytes = _rasterize_netl_features(features, parsed_bbox)
                 return _cache_and_respond(_public_land_tile_cache, bbox, tile_bytes, "padus-primary")
         except (httpx.TimeoutException, httpx.HTTPError, ValueError):
             pass  # retry once, then fall through to NETL fallback below
@@ -1636,8 +1693,7 @@ async def public_land_tile(bbox: str):
         features = data.get("features") or []
         if not features:
             return _cache_and_respond(_public_land_tile_cache, bbox, _blank_tile(), "none-empty")
-        async with _rasterize_semaphore:
-            tile_bytes = _rasterize_netl_features(features, parsed_bbox)
+        tile_bytes = _rasterize_netl_features(features, parsed_bbox)
         return _cache_and_respond(_public_land_tile_cache, bbox, tile_bytes, "netl-fallback")
     except Exception:
         # Both sources failed -- degrade to a blank tile rather than a broken image or a
