@@ -1454,6 +1454,19 @@ TILE_CACHE_MAX_ENTRIES = 4000
 _public_land_tile_cache: dict[str, tuple[float, bytes, str]] = {}  # bbox -> (expires_at, png_bytes, source)
 _usace_tile_cache: dict[str, tuple[float, bytes, str]] = {}
 
+# The Sept 11 OOM kill recurred even after the cache above shipped: cache hits avoid re-
+# rendering, but a burst of *first-time* pans (new area, cache miss on every tile) still fires
+# many concurrent _rasterize_netl_features() calls, and each one allocates several full
+# 1024x1024 (4x-supersampled) RGBA buffers (fill_layer, outline_layer, per-ring/per-feature
+# masks, composited) -- roughly 20-30MB of transient Pillow buffers per in-flight render. With
+# no cap, a fast-panning burst across new territory can stack up enough concurrent renders to
+# exceed the 512Mi instance limit regardless of caching. This semaphore bounds how many
+# rasterizations run at once (per worker); anything beyond the limit just waits its turn
+# instead of piling up more concurrent buffers. Deliberately generous enough to not bottleneck
+# normal use, tight enough to cap worst-case memory.
+_RASTERIZE_CONCURRENCY = 3
+_rasterize_semaphore = asyncio.Semaphore(_RASTERIZE_CONCURRENCY)
+
 
 def _tile_cache_get(cache: dict[str, tuple[float, bytes, str]], key: str) -> tuple[bytes, str] | None:
     entry = cache.get(key)
@@ -1596,7 +1609,8 @@ async def public_land_tile(bbox: str):
                 features = data.get("features") or []
                 if not features:
                     return _cache_and_respond(_public_land_tile_cache, bbox, _blank_tile(), "padus-primary-empty")
-                tile_bytes = _rasterize_netl_features(features, parsed_bbox)
+                async with _rasterize_semaphore:
+                    tile_bytes = _rasterize_netl_features(features, parsed_bbox)
                 return _cache_and_respond(_public_land_tile_cache, bbox, tile_bytes, "padus-primary")
         except (httpx.TimeoutException, httpx.HTTPError, ValueError):
             pass  # retry once, then fall through to NETL fallback below
@@ -1622,7 +1636,8 @@ async def public_land_tile(bbox: str):
         features = data.get("features") or []
         if not features:
             return _cache_and_respond(_public_land_tile_cache, bbox, _blank_tile(), "none-empty")
-        tile_bytes = _rasterize_netl_features(features, parsed_bbox)
+        async with _rasterize_semaphore:
+            tile_bytes = _rasterize_netl_features(features, parsed_bbox)
         return _cache_and_respond(_public_land_tile_cache, bbox, tile_bytes, "netl-fallback")
     except Exception:
         # Both sources failed -- degrade to a blank tile rather than a broken image or a
