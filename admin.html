@@ -18,6 +18,9 @@
 <meta name="theme-color" content="#14120e" />
 
 <style>
+  /* style.css sets html,body{height:100%;overflow:hidden} for the main map app's internal scroll
+     panels — this page has no such panel and needs normal document scrolling, so override it here. */
+  html, body { height: auto; overflow: visible; }
   body { background: var(--color-bg); color: var(--color-text); font-family: var(--font-body); min-height: 100dvh; }
   .admin-wrap { max-width: 880px; margin: 0 auto; padding: var(--space-8) var(--space-5) var(--space-24); }
   .admin-brand { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-8); }
@@ -29,13 +32,15 @@
   .card { background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-lg); padding: var(--space-6); margin-bottom: var(--space-6); }
   .card h2 { font-family: var(--font-display); font-size: var(--text-lg); font-weight: 700; margin-bottom: var(--space-4); }
   label { display: block; font-size: var(--text-xs); color: var(--color-text-muted); margin-bottom: var(--space-1); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
-  input[type="text"], input[type="password"], input[type="number"] {
+  input[type="text"], input[type="password"], input[type="number"], input[type="email"] {
     width: 100%; background: var(--color-surface-2); border: 1px solid var(--color-border); border-radius: var(--radius-md);
     padding: var(--space-3); color: var(--color-text); font-family: var(--font-body); font-size: var(--text-sm); margin-bottom: var(--space-4);
   }
   input:focus { outline: 2px solid var(--color-primary); outline-offset: 1px; }
   .row { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); }
+  .row-3 { display: grid; grid-template-columns: 1.3fr 1.3fr 1fr; gap: var(--space-4); }
   @media (max-width: 560px) { .row { grid-template-columns: 1fr; } }
+  @media (max-width: 700px) { .row-3 { grid-template-columns: 1fr; } }
   button.btn-primary-admin {
     background: var(--color-primary); color: var(--color-text-inverse); font-weight: 700; font-size: var(--text-sm);
     border: none; border-radius: var(--radius-full); padding: var(--space-3) var(--space-6); cursor: pointer;
@@ -63,6 +68,7 @@
     font-family: var(--font-mono); font-size: var(--text-xs); background: var(--color-surface-2); padding: var(--space-2) var(--space-3);
     border-radius: var(--radius-sm); word-break: break-all; flex: 1; min-width: 220px;
   }
+  #grantsTableWrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
   th, td { text-align: left; padding: var(--space-3); border-bottom: 1px solid var(--color-divider); vertical-align: middle; }
   th { color: var(--color-text-muted); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
@@ -111,14 +117,18 @@
 
   <div id="mainScreen">
     <h1>Complimentary Premium access</h1>
-    <p class="admin-sub">Generate a one-time link that grants a specific person full Premium access — nationwide property lines &amp; Scout AI — for free, for a chosen number of days. No Stripe billing is involved.</p>
+    <p class="admin-sub">Generate a one-time link that grants a specific person full Premium access — nationwide property lines &amp; Scout AI — for free, for a chosen number of days. No Stripe billing is involved. Their email is required so they can restore access themselves later (Restore Purchase in the app) if they ever switch devices or reinstall.</p>
 
     <div class="card">
       <h2>Create a new grant</h2>
-      <div class="row">
+      <div class="row-3">
         <div>
           <label for="grantLabel">Label (for your reference)</label>
           <input type="text" id="grantLabel" placeholder="e.g. Dad, hunting buddy Josh" />
+        </div>
+        <div>
+          <label for="grantEmail">Their email (for restore)</label>
+          <input type="email" id="grantEmail" placeholder="e.g. dad@example.com" autocomplete="off" />
         </div>
         <div>
           <label for="grantDays">Duration (days)</label>
@@ -137,7 +147,10 @@
     </div>
 
     <div class="card">
-      <h2>Existing grants</h2>
+      <div style="display:flex; align-items:center; justify-content:space-between; gap: var(--space-3); flex-wrap: wrap; margin-bottom: var(--space-4);">
+        <h2 style="margin-bottom:0;">Existing grants</h2>
+        <button class="btn-ghost-admin" id="clearOldBtn" type="button" disabled>Clear old grants</button>
+      </div>
       <div id="grantsTableWrap">
         <div class="empty-note">Loading…</div>
       </div>
@@ -234,6 +247,7 @@
       const rows = grants.map((g) => `
         <tr>
           <td>${g.label ? escapeHtml(g.label) : '<span style="color:var(--color-text-faint)">—</span>'}</td>
+          <td>${g.email ? escapeHtml(g.email) : '<span style="color:var(--color-text-faint)">— (no restore)</span>'}</td>
           <td class="mono">${g.code}</td>
           <td>${fmtDate(g.createdAt)}</td>
           <td>${statusBadge(g.status)}</td>
@@ -244,13 +258,13 @@
                  <button class="btn-danger-admin" data-delete="${g.code}">Delete</button>`
               : g.status === 'active'
                 ? `<button class="btn-danger-admin" data-revoke="${g.code}">Revoke</button>`
-                : ''}
+                : `<button class="btn-ghost-admin" data-delete="${g.code}">Delete</button>`}
           </td>
         </tr>
       `).join('');
       wrap.innerHTML = `
         <table>
-          <thead><tr><th>Label</th><th>Code</th><th>Created</th><th>Status</th><th>Expires</th><th></th></tr></thead>
+          <thead><tr><th>Label</th><th>Email</th><th>Code</th><th>Created</th><th>Status</th><th>Expires</th><th></th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
       `;
@@ -263,6 +277,10 @@
       wrap.querySelectorAll('[data-delete]').forEach((b) =>
         b.addEventListener('click', () => deleteGrant(b.dataset.delete))
       );
+      const oldCount = grants.filter((g) => g.status === 'revoked' || g.status === 'expired').length;
+      const clearBtn = document.getElementById('clearOldBtn');
+      clearBtn.textContent = oldCount ? `Clear old grants (${oldCount})` : 'Clear old grants';
+      clearBtn.disabled = !oldCount;
     } catch (e) {
       if (e.message !== 'unauthorized') {
         wrap.innerHTML = `<div class="empty-note">Could not load grants — ${escapeHtml(e.message)}</div>`;
@@ -295,13 +313,28 @@
   }
 
   async function deleteGrant(code) {
-    if (!confirm('Delete this unredeemed code?')) return;
+    if (!confirm('Permanently delete this grant record? This cannot be undone.')) return;
     try {
       await adminFetch(`/api/admin/grants/${encodeURIComponent(code)}`, { method: 'DELETE' });
-      toast('Code deleted');
+      toast('Grant deleted');
       loadGrants();
     } catch (e) {
-      if (e.message !== 'unauthorized') toast(e.message || 'Could not delete code');
+      if (e.message !== 'unauthorized') toast(e.message || 'Could not delete grant');
+    }
+  }
+
+  async function clearOldGrants() {
+    const btn = document.getElementById('clearOldBtn');
+    if (btn.disabled) return;
+    if (!confirm('Permanently delete every revoked and expired grant? Active and pending grants are never touched. This cannot be undone.')) return;
+    btn.disabled = true;
+    try {
+      const res = await adminFetch('/api/admin/grants/clear-old', { method: 'POST' });
+      toast(`Deleted ${res.deleted} old grant${res.deleted === 1 ? '' : 's'}`);
+      loadGrants();
+    } catch (e) {
+      if (e.message !== 'unauthorized') toast(e.message || 'Could not clear old grants');
+      btn.disabled = false;
     }
   }
 
@@ -354,6 +387,8 @@
     }
   });
 
+  document.getElementById('clearOldBtn').addEventListener('click', clearOldGrants);
+
   unlockBtn.addEventListener('click', async () => {
     const key = adminKeyInput.value.trim();
     if (!key) return;
@@ -373,22 +408,29 @@
 
   document.getElementById('createGrantBtn').addEventListener('click', async () => {
     const label = document.getElementById('grantLabel').value.trim() || null;
+    const email = document.getElementById('grantEmail').value.trim();
     const days = parseInt(document.getElementById('grantDays').value, 10) || 365;
     const errEl = document.getElementById('createErr');
     const resultBox = document.getElementById('resultBox');
     errEl.classList.remove('is-visible');
     resultBox.classList.remove('is-visible');
+    if (!email || !email.includes('@')) {
+      errEl.textContent = 'Enter their email so they can restore access later if needed';
+      errEl.classList.add('is-visible');
+      return;
+    }
     try {
       const data = await adminFetch('/api/admin/grants', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label, duration_days: days }),
+        body: JSON.stringify({ label, email, duration_days: days }),
       });
       const link = `${location.origin}/?redeem=${data.code}`;
       document.getElementById('resultLink').textContent = link;
       resultBox.classList.add('is-visible');
       document.getElementById('copyLinkBtn').onclick = () => copyText(link);
       document.getElementById('grantLabel').value = '';
+      document.getElementById('grantEmail').value = '';
       loadGrants();
     } catch (e) {
       if (e.message !== 'unauthorized') {
