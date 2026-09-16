@@ -1465,20 +1465,35 @@ PADUS_PRIMARY_DYNAMIC_LAYERS = json.dumps([{
 # server-to-server request from this backend isn't subject to browser CORS at all, so simply
 # proxying it here fixes the layer with no change to USACE's own access policy required.
 #
-# Fill opacity: confirmed live (2026-09-15) that this authoritative Corps boundary is the
-# CORRECT/larger public-land shape at reservoirs like Mark Twain Lake -- PAD-US's own record
-# for the same reservoir is essentially just the water's outline (its GIS_Acres almost exactly
-# matches the lake's surface acreage), while this REMIS layer extends into the real surrounding
-# Corps-managed land. But at the old alpha=10 (~4% opacity) that correct, larger boundary was
-# rendered too faint to see against satellite imagery, so users only ever noticed the narrower
-# PAD-US shoreline outline and read the overlay as "public land stops at the water's edge" --
-# reported as an inaccurate boundary around Mark Twain Lake. User picked "Subtle" (~15% =
-# rendered alpha 38/255). IMPORTANT: this MapServer's dynamicLayers renderer attenuates the
-# requested fill alpha by a consistent ~0.588x factor before rasterizing (confirmed live by
-# probing requested alphas 10/38/65/100/255 -> rendered 6/22/38/59/150, a stable ratio) -- so
-# the `color` alpha below must be requested pre-scaled (65) to actually render at 38/255 on
-# screen. Do not "fix" this to a naive 38 -- that would silently render at ~22 (~9%) instead.
-# Outline unchanged.
+# Fill opacity -- IMPORTANT CAVEAT (2026-09-15, follow-up): this REMIS "Site" layer is the
+# Corps' full PROJECT ACQUISITION boundary, not a "land open to the public" boundary. It
+# legitimately includes privately-titled flowage-easement land (the Corps holds flood-control
+# rights but the landowner keeps title and keeps farming it -- verified with the Corps' own
+# district page: https://www.swf-wc.usace.army.mil/lakeopines/Realestate/Adjland.shtml) plus
+# other closed areas (developed recreation sites, waterfowl refuge in season). Cross-checked at
+# Mark Twain Lake: this polygon computes to ~65,251 acres, vs. the Corps' own published
+# "approximately 45,000 acres of land and water are available for hunting" figure
+# (https://www.mvs.usace.army.mil/Missions/Recreation/Mark-Twain-Lake/Recreation/Hunting/) --
+# roughly 20,000 acres too generous. Confirmed no available government layer can cleanly
+# subtract the difference: REMIS layer 4 ("Land Parcel Area") has an RPINTEREST field that
+# would carry Fee vs. Flowage Easement, but it's NULL for every parcel at this project; REMIS
+# layer 2 ("Outgrant Area", agricultural/other leases) returns zero records here; PAD-US's own
+# USACE record for this reservoir is Category="Designation" at only ~19,446 acres (essentially
+# just the water surface, not the surrounding land at all). The onX-style correct fix would be
+# cross-referencing county tax-assessor parcel ownership (exclude any parcel still privately
+# titled) -- that needs a paid parcel-data provider and is intentionally NOT done here; user
+# chose a cheap interim stopgap instead (2026-09-15): dial opacity back down from the prior
+# "Subtle" pick (rendered 38/255, ~15%) to a fainter ~10% (rendered ~26/255) so the over-broad
+# fill reads as a rough reference rather than a precise access boundary, paired with an
+# in-app disclaimer on the layer toggle itself (see app.js LAYER_DEFS 'public' row). Do not
+# raise this back toward "Subtle" without either sourcing parcel data to exclude private
+# in-holdings, or re-confirming with the user that the trespassing-risk tradeoff is acceptable.
+# IMPORTANT: this MapServer's dynamicLayers renderer attenuates the requested fill alpha by a
+# consistent ~0.588x factor before rasterizing (confirmed live by probing requested alphas
+# 10/38/65/100/255 -> rendered 6/22/38/59/150, a stable ratio) -- so the `color` alpha below
+# must be requested pre-scaled (45 -> renders ~26/255) to hit the intended ~10% on screen. Do
+# not "fix" this to a naive 26 -- that would silently render at ~15 (~6%) instead. Outline
+# unchanged.
 USACE_CWLDM_TILE_SERVICE = "https://geospatial.sec.usace.army.mil/server/rest/services/REMIS/cwldm/MapServer/export"
 USACE_CWLDM_DYNAMIC_LAYERS = json.dumps([{
     "id": 5,
@@ -1489,7 +1504,7 @@ USACE_CWLDM_DYNAMIC_LAYERS = json.dumps([{
             "symbol": {
                 "type": "esriSFS",
                 "style": "esriSFSSolid",
-                "color": [57, 255, 20, 65],
+                "color": [57, 255, 20, 45],
                 "outline": {"type": "esriSLS", "style": "esriSLSSolid", "color": [57, 255, 20, 210], "width": 0.75},
             },
         },
