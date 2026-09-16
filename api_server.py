@@ -1247,9 +1247,18 @@ async def _load_shared_ordered(code: str) -> list[dict]:
 
 
 @app.get("/api/waypoints/share/{code}")
-async def preview_share(code: str):
+async def preview_share(code: str, request: Request):
+    # Read-only, no-grant preview so the frontend can show an onX-style "Pin shared with
+    # you -- Accept/Decline" prompt BEFORE anything is recorded. Deliberately returns only
+    # a count, never the pin contents/coordinates themselves -- those stay hidden until the
+    # recipient actually accepts, same boundary as the accept endpoint's rate limiting.
+    await rate_limit(f"share-preview:{client_ip(request)}", limit=30, window_seconds=60)
+    share_res = await supabase.table("waypoint_shares").select("visitor_id").eq("code", code).limit(1).execute()
+    if not share_res.data:
+        raise HTTPException(404, "This share link is invalid or has expired")
+    owner_vid = share_res.data[0]["visitor_id"]
     rows = await _load_shared_ordered(code)
-    return {"waypoints": [_waypoint_dict(r) for r in rows]}
+    return {"count": len(rows), "ownLink": owner_vid == request.state.vid}
 
 
 @app.post("/api/waypoints/share/{code}/accept")
