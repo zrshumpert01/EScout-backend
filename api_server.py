@@ -1464,6 +1464,21 @@ PADUS_PRIMARY_DYNAMIC_LAYERS = json.dumps([{
 # blocks this tile as a CORS failure regardless of whether the USACE server itself is up. A
 # server-to-server request from this backend isn't subject to browser CORS at all, so simply
 # proxying it here fixes the layer with no change to USACE's own access policy required.
+#
+# Fill opacity: confirmed live (2026-09-15) that this authoritative Corps boundary is the
+# CORRECT/larger public-land shape at reservoirs like Mark Twain Lake -- PAD-US's own record
+# for the same reservoir is essentially just the water's outline (its GIS_Acres almost exactly
+# matches the lake's surface acreage), while this REMIS layer extends into the real surrounding
+# Corps-managed land. But at the old alpha=10 (~4% opacity) that correct, larger boundary was
+# rendered too faint to see against satellite imagery, so users only ever noticed the narrower
+# PAD-US shoreline outline and read the overlay as "public land stops at the water's edge" --
+# reported as an inaccurate boundary around Mark Twain Lake. User picked "Subtle" (~15% =
+# rendered alpha 38/255). IMPORTANT: this MapServer's dynamicLayers renderer attenuates the
+# requested fill alpha by a consistent ~0.588x factor before rasterizing (confirmed live by
+# probing requested alphas 10/38/65/100/255 -> rendered 6/22/38/59/150, a stable ratio) -- so
+# the `color` alpha below must be requested pre-scaled (65) to actually render at 38/255 on
+# screen. Do not "fix" this to a naive 38 -- that would silently render at ~22 (~9%) instead.
+# Outline unchanged.
 USACE_CWLDM_TILE_SERVICE = "https://geospatial.sec.usace.army.mil/server/rest/services/REMIS/cwldm/MapServer/export"
 USACE_CWLDM_DYNAMIC_LAYERS = json.dumps([{
     "id": 5,
@@ -1474,7 +1489,7 @@ USACE_CWLDM_DYNAMIC_LAYERS = json.dumps([{
             "symbol": {
                 "type": "esriSFS",
                 "style": "esriSFSSolid",
-                "color": [57, 255, 20, 10],
+                "color": [57, 255, 20, 65],
                 "outline": {"type": "esriSLS", "style": "esriSLSSolid", "color": [57, 255, 20, 210], "width": 0.75},
             },
         },
