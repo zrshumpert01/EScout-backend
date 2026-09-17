@@ -2082,6 +2082,158 @@ async def usace_land_tile(bbox: str):
     return Response(content=_blank_tile(), media_type="image/png", headers={"X-Tile-Source": "none-error"})
 
 
+# USGS's 3DEP elevation ImageServer renders each contour-line tile on the fly from raw
+# lidar/DEM data instead of serving a pre-cached tile -- confirmed directly against the live
+# service: a never-before-requested bbox took 3-15 seconds to render, vs sub-second for every
+# other proxied source in this file. The in-memory dict caches above (_public_land_tile_cache,
+# _usace_tile_cache) don't help here in the way they do for those fast sources: this app gets
+# redeployed frequently, which wipes process memory, so a slow render would keep happening
+# again for the first viewer of any area after every deploy. Instead this uses the durable
+# contour_tile_cache Postgres table (via Supabase) -- once ANY user anywhere has rendered a
+# given z/bbox/rule combination, every later request for it (their next visit, a different
+# user, after a redeploy) is a fast DB read instead of a multi-second upstream render.
+USGS_CONTOUR_SERVICE = "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage"
+CONTOUR_RENDERING_RULES = {
+    "fine": '{"rasterFunction": "Preset 10ft Contour Interval"}',
+    "coarse": '{"rasterFunction": "Contour Smoothed 25"}',
+}
+
+
+# Web Mercator (EPSG:3857) world bounds, with a small margin -- used to reject NaN/Infinity
+# and grossly out-of-range bbox values before they reach the upstream ArcGIS call or the
+# cache-key hash, per the pre-publish security review's bbox-validation finding.
+_WEB_MERCATOR_WORLD_BOUND = 20_037_508.34 * 1.05
+
+
+def _validate_contour_bbox(bbox: str) -> tuple[float, float, float, float]:
+    """Parses and sanity-checks a contour tile bbox, then returns a canonicalized
+    (fixed-precision) version. Canonicalizing collapses formatting variants of what is
+    effectively the same tile (extra decimal places, trailing zeros, etc.) into one cache
+    key, so the durable cache can't be flooded with unbounded near-duplicate rows.
+    """
+    xmin, ymin, xmax, ymax = _parse_bbox(bbox)
+    for v in (xmin, ymin, xmax, ymax):
+        if not math.isfinite(v):
+            raise ValueError("bbox values must be finite")
+        if abs(v) > _WEB_MERCATOR_WORLD_BOUND:
+            raise ValueError("bbox out of world bounds")
+    if xmax <= xmin or ymax <= ymin:
+        raise ValueError("bbox must have positive width and height")
+    span_x, span_y = xmax - xmin, ymax - ymin
+    # A single 256px tile never legitimately spans more than one world-width; this also
+    # bounds how much upstream-render cost a single request can trigger.
+    if span_x > 2 * _WEB_MERCATOR_WORLD_BOUND or span_y > 2 * _WEB_MERCATOR_WORLD_BOUND:
+        raise ValueError("bbox span too large")
+    # Centimeter precision is far finer than this layer ever needs and keeps the cache key
+    # stable across floating-point formatting noise from the client.
+    return (round(xmin, 2), round(ymin, 2), round(xmax, 2), round(ymax, 2))
+
+
+def _contour_cache_key(z: int, bbox: tuple[float, float, float, float], rule: str) -> str:
+    canon = ",".join(f"{v:.2f}" for v in bbox)
+    return hashlib.sha256(f"{z}|{canon}|{rule}".encode()).hexdigest()
+
+
+async def _contour_cache_get(cache_key: str) -> bytes | None:
+    try:
+        res = await supabase.table("contour_tile_cache").select("png_data").eq("cache_key", cache_key).limit(1).execute()
+        if not res.data:
+            return None
+        hex_str = res.data[0]["png_data"]
+        # PostgREST serializes bytea columns as Postgres hex-encoded text ("\x...").
+        if not isinstance(hex_str, str):
+            raise ValueError("unexpected png_data type")
+        if hex_str.startswith("\\x"):
+            hex_str = hex_str[2:]
+        data = bytes.fromhex(hex_str)
+        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("cached row is not a valid PNG")
+        return data
+    except Exception:
+        # A malformed/corrupt row (or a transient read error) should degrade to a cache miss
+        # -- re-render and overwrite -- rather than 500 the request the user is waiting on.
+        return None
+
+
+async def _contour_cache_set(cache_key: str, data: bytes) -> None:
+    try:
+        await supabase.table("contour_tile_cache").upsert(
+            {"cache_key": cache_key, "png_data": "\\x" + data.hex()}, on_conflict="cache_key"
+        ).execute()
+    except Exception:
+        pass  # a cache write failure shouldn't fail the tile response the user is waiting on
+
+
+@app.get("/api/tiles/contour")
+async def contour_tile(request: Request, z: int, bbox: str, rule: str):
+    """Proxies + permanently caches a USGS 3DEP contour-line tile render. `rule` is the
+    frontend's already-computed zoom-tier choice ('fine' below CONTOUR_ZOOM_DETAIL_THRESHOLD,
+    'coarse' above it) -- validated against an allow-list here rather than trusted as a raw
+    ArcGIS renderingRule string, since that's user-reachable input. Recoloring/halo styling
+    still happens client-side in the escout-recolor protocol handler; this endpoint only
+    serves the raw (near-black line) elevation render, which is style-independent and safe to
+    cache indefinitely -- the underlying elevation data doesn't change.
+    """
+    if rule not in CONTOUR_RENDERING_RULES:
+        raise HTTPException(status_code=400, detail="invalid rule")
+    if not (0 <= z <= 22):
+        raise HTTPException(status_code=400, detail="invalid z")
+    try:
+        canon_bbox = _validate_contour_bbox(bbox)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid bbox")
+
+    cache_key = _contour_cache_key(z, canon_bbox, rule)
+    cached = await _contour_cache_get(cache_key)
+    if cached is not None:
+        return Response(
+            content=cached,
+            media_type="image/png",
+            headers={"X-Tile-Source": "contour-cached", "Cache-Control": "public, max-age=604800, immutable"},
+        )
+
+    # Only the real upstream-render path is rate-limited -- cache hits are cheap DB reads and
+    # shouldn't be throttled during normal panning. Capped lower than most other per-IP limits
+    # in this file (20/min, matching the checkout/portal tier) because each miss can trigger a
+    # multi-second external render plus a database write, unlike the cheap-read routes that use
+    # the higher 60/min tier.
+    await rate_limit(f"contour_miss:{client_ip(request)}", limit=20, window_seconds=60)
+
+    canon_bbox_str = ",".join(f"{v:.2f}" for v in canon_bbox)
+    params = {
+        "bbox": canon_bbox_str,
+        "bboxSR": 3857,
+        "imageSR": 3857,
+        "size": f"{TILE_SIZE},{TILE_SIZE}",
+        "format": "png32",
+        "transparent": "true",
+        "renderingRule": CONTOUR_RENDERING_RULES[rule],
+        "f": "image",
+    }
+    last_error = None
+    for attempt in range(3):
+        try:
+            resp = await http_client.get(USGS_CONTOUR_SERVICE, params=params, timeout=httpx.Timeout(40.0))
+            content_type = resp.headers.get("content-type", "")
+            if resp.status_code == 200 and content_type.startswith("image/"):
+                await _contour_cache_set(cache_key, resp.content)
+                return Response(
+                    content=resp.content,
+                    media_type="image/png",
+                    headers={"X-Tile-Source": "contour-direct", "Cache-Control": "public, max-age=604800, immutable"},
+                )
+            last_error = f"status {resp.status_code}"
+        except (httpx.TimeoutException, httpx.HTTPError) as e:
+            last_error = str(e)
+        if attempt < 2:
+            await asyncio.sleep(0.4 * (attempt + 1))
+    # Upstream failed after retries -- degrade to a blank tile, uncached, so a transient
+    # outage doesn't get stuck serving blank tiles after USGS recovers.
+    return Response(
+        content=_blank_tile(), media_type="image/png", headers={"X-Tile-Source": "none-error", "X-Tile-Error": last_error or "unknown"}
+    )
+
+
 # ---------------------------------------------------------------------------------------
 # Private roads (OpenStreetMap access=private ways) -- the standard Esri road raster layer
 # (see escout-roads in app.js) has NO attribute data at all, so it can never distinguish a
