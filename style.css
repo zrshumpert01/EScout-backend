@@ -1434,6 +1434,13 @@ body {
   gap: 6px;
   margin-top: 4px;
 }
+.popup-shared-by {
+  color: var(--color-primary);
+}
+.popup-shared-by strong {
+  color: var(--color-primary);
+  font-weight: 700;
+}
 .popup-coords-text {
   font-family: var(--font-mono, monospace);
   font-size: var(--text-xs);
