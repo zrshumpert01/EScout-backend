@@ -15,7 +15,7 @@
 <script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
 
 <link rel="stylesheet" href="./base.css?v=824bf038" />
-<link rel="stylesheet" href="./style.css?v=16thsection1" />
+<link rel="stylesheet" href="./style.css?v=acctsys1" />
 
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2314120e'/%3E%3Crect x='2' y='2' width='28' height='28' rx='6' fill='none' stroke='%236a9169' stroke-width='1' opacity='0.35'/%3E%3Cpath d='M6 22l6-11 4 6 4-9 6 14' fill='none' stroke='%236a9169' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='16' cy='8' r='1.6' fill='%236a9169'/%3E%3C/svg%3E" />
 
@@ -27,6 +27,48 @@
 <meta name="apple-mobile-web-app-title" content="EScout" />
 </head>
 <body>
+
+<div id="authGate" class="auth-gate" hidden>
+  <div class="auth-gate__card">
+    <button type="button" class="auth-gate__close" id="authGateClose" aria-label="Close" hidden>&times;</button>
+    <div class="auth-gate__brand">
+      <svg viewBox="0 0 32 32" fill="none" aria-hidden="true">
+        <rect x="1" y="1" width="30" height="30" rx="8" stroke="currentColor" stroke-width="1.6" opacity="0.35"/>
+        <path d="M6 22l6-11 4 6 4-9 6 14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="16" cy="8" r="1.6" fill="currentColor"/>
+      </svg>
+      <span>E<span class="auth-gate__brand-accent">Scout</span></span>
+    </div>
+
+    <div id="authStepEmail" class="auth-gate__step">
+      <h2>Sign in to EScout</h2>
+      <p class="auth-gate__sub">Your pins, subscription, and map all follow your account — no password needed, just a code we email you.</p>
+      <label class="auth-gate__label" for="authEmailInput">Email address</label>
+      <input type="email" id="authEmailInput" class="auth-gate__input" autocomplete="email" inputmode="email" placeholder="you@example.com" />
+      <div class="auth-gate__error" id="authEmailError" hidden></div>
+      <button type="button" id="authSendCodeBtn" class="btn btn-primary auth-gate__submit">Send code</button>
+    </div>
+
+    <div id="authStepCode" class="auth-gate__step" hidden>
+      <h2>Enter your code</h2>
+      <p class="auth-gate__sub">We sent a 6-digit code to <strong id="authCodeEmailLabel"></strong>. It expires in 10 minutes.</p>
+      <label class="auth-gate__label" for="authCodeInput">Verification code</label>
+      <input type="text" id="authCodeInput" class="auth-gate__input auth-gate__input--code" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="000000" autocomplete="one-time-code" />
+      <div class="auth-gate__error" id="authCodeError" hidden></div>
+      <button type="button" id="authVerifyBtn" class="btn btn-primary auth-gate__submit">Verify &amp; sign in</button>
+      <div class="auth-gate__links">
+        <button type="button" id="authResendBtn" class="auth-gate__link">Resend code</button>
+        <button type="button" id="authChangeEmailBtn" class="auth-gate__link">Use a different email</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="authBanner" class="auth-banner" hidden>
+  <span class="auth-banner__text">Create your free account to keep your pins and subscription synced everywhere.</span>
+  <button type="button" id="authBannerSignIn" class="auth-banner__cta">Sign in</button>
+  <button type="button" id="authBannerDismiss" class="auth-banner__dismiss" aria-label="Dismiss">&times;</button>
+</div>
 
 <div id="app">
   <!-- ================= TOP BAR ================= -->
@@ -89,9 +131,9 @@
         <svg class="wind-dir-arrow" id="windDirArrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 19V5M12 5l-5 5M12 5l5 5"/></svg>
         Wind <strong id="windHudLabel">Reading…</strong>
       </div>
-      <div class="hud-chip hud-chip-moon">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v2M12 19v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M2 12h2M20 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"/><circle cx="12" cy="12" r="4.5"/></svg>
-        Moon <strong>Waning · 38%</strong>
+      <div class="hud-chip hud-chip-moon" id="moonHudChip" title="Tonight's moon phase and illumination">
+        <span class="moon-hud-icon" id="moonHudIcon" aria-hidden="true"></span>
+        Moon <strong id="moonHudLabel">Calculating…</strong>
       </div>
       <button class="btn plan-chip is-free" id="planChipBtn" data-open-pricing>
         <span class="plan-dot"></span>
@@ -203,6 +245,10 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="2" width="12" height="20" rx="2.5"/><path d="M11 18h2"/></svg>
         <span class="rail-tip">Get App</span>
       </button>
+      <button class="rail-btn" id="shareAppBtn" aria-label="Share EScout with a friend">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="2.6"/><circle cx="6" cy="12" r="2.6"/><circle cx="18" cy="19" r="2.6"/><path d="M8.3 10.7l7.4-4.4M8.3 13.3l7.4 4.4"/></svg>
+        <span class="rail-tip">Share App</span>
+      </button>
 
       <div class="rail-divider"></div>
 
@@ -243,6 +289,22 @@
       <div class="install-banner-actions">
         <button class="btn btn-amber" id="installBannerAction" type="button">Install</button>
         <button class="icon-btn install-banner-close" id="installBannerClose" aria-label="Dismiss install prompt" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="share-banner" id="shareBanner" role="dialog" aria-live="polite" aria-label="Share EScout">
+      <div class="share-banner-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="2.6"/><circle cx="6" cy="12" r="2.6"/><circle cx="18" cy="19" r="2.6"/><path d="M8.3 10.7l7.4-4.4M8.3 13.3l7.4 4.4"/></svg>
+      </div>
+      <div class="share-banner-body">
+        <div class="share-banner-title">Love the app?</div>
+        <div class="share-banner-desc">Share it with a friend!</div>
+      </div>
+      <div class="share-banner-actions">
+        <button class="btn btn-primary share-flash" id="shareBannerActionBtn" type="button">Share</button>
+        <button class="icon-btn share-banner-close" id="shareBannerClose" aria-label="Dismiss" type="button">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
         </button>
       </div>
@@ -374,9 +436,15 @@
       <h2 id="shareHeading">Share your pins</h2>
       <p id="shareModalCount">Sharing 1 pin</p>
     </div>
+    <div class="share-native-row" id="shareNativeRow" style="display:none;">
+      <button class="btn btn-amber share-native-btn" id="shareNativeBtn" type="button">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M5 14v4a2 2 0 002 2h10a2 2 0 002-2v-4"/></svg>
+        Share via Messages, Mail…
+      </button>
+    </div>
     <div class="share-link-row">
       <input type="text" id="shareLinkInput" readonly aria-label="Shareable pin link" />
-      <button class="btn btn-amber" id="shareCopyBtn" type="button">Copy link</button>
+      <button class="btn btn-ghost" id="shareCopyBtn" type="button">Copy link</button>
     </div>
     <p class="share-modal-hint">Anyone who opens this link gets a live, view-only copy on their map that updates whenever you move or edit yours — they can't edit, delete, or re-share it. Revoke access for anyone below, any time.</p>
     <div class="share-access-section" id="shareAccessSection" style="display:none;">
@@ -386,6 +454,39 @@
   </div>
 </div>
 
-<script src="./app.js?v=16thsection1"></script>
+<!-- ================= ACCEPT SHARED PIN MODAL ================= -->
+<div class="modal-backdrop" id="acceptShareModal">
+  <div class="modal accept-share-modal" role="dialog" aria-modal="true" aria-labelledby="acceptShareHeading">
+    <div class="modal-head">
+      <h2 id="acceptShareHeading">Pin shared with you</h2>
+      <p id="acceptShareDesc">A hunter shared a pin with you</p>
+    </div>
+    <p class="share-modal-hint">Accepting adds a live, view-only copy to your map — it stays in sync with theirs, and you can remove it from your map any time without affecting their original.</p>
+    <div class="accept-share-actions">
+      <button class="btn btn-ghost" id="declineShareBtn" type="button">Decline</button>
+      <button class="btn btn-amber" id="acceptShareBtn" type="button">Accept</button>
+    </div>
+  </div>
+</div>
+
+<!-- ================= WIND & THERMAL FORECAST MODAL ================= -->
+<div class="modal-backdrop" id="windForecastModal">
+  <div class="modal wind-forecast-modal" role="dialog" aria-modal="true" aria-labelledby="windForecastHeading">
+    <button class="icon-btn modal-close" id="windForecastClose" aria-label="Close wind forecast">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+    </button>
+    <div class="modal-head">
+      <h2 id="windForecastHeading">Wind &amp; Thermal Forecast</h2>
+      <p id="windForecastSubhead">For this map view</p>
+    </div>
+    <div class="wf-day-tabs" id="wfDayTabs" role="tablist"></div>
+    <div class="wf-body" id="wfBody">
+      <div class="wf-status" id="wfStatus">Loading forecast…</div>
+    </div>
+    <p class="share-modal-hint">Wind data from <a href="https://open-meteo.com" target="_blank" rel="noopener">Open-Meteo</a>. Thermal windows are estimated from sunrise/sunset — actual thermals vary with cloud cover, terrain, and how much the temperature swings.</p>
+  </div>
+</div>
+
+<script src="./app.js?v=acctsys1"></script>
 </body>
 </html>
