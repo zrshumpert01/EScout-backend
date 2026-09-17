@@ -975,6 +975,7 @@ async def restore_request(body: RestoreBody, request: Request):
         "attempts": 0,
         "expires_at": now + RESTORE_CODE_TTL_SECONDS,
         "created_at": now,
+        "purpose": "restore",
     }).execute()
     await _send_restore_code_email(email, code)
     # Generic response regardless of whether this email actually has an active subscription —
@@ -1001,6 +1002,7 @@ async def restore_confirm(body: RestoreConfirmBody, request: Request):
         .select("id,code_hash,vid,attempts,expires_at,used_at")
         .eq("email", email)
         .eq("vid", vid)
+        .eq("purpose", "restore")
         .order("created_at", desc=True)
         .limit(1)
         .execute()
@@ -1077,8 +1079,219 @@ async def restore_confirm(body: RestoreConfirmBody, request: Request):
 
 
 # ------------------------------------------------------------------------------------------
+# Accounts — every visitor must sign in with an email + one-time code before using the app.
+# There is no password: the same Resend-based verification code mechanism above (built for
+# Restore Purchase) doubles as the sign-in step, just tagged with purpose="login" so the two
+# code streams never cross. An account is just a durable mapping from email -> whichever
+# visitor_id is "canonical" for that person. The very first device to ever verify a given
+# email becomes canonical automatically (nothing to migrate, its existing data is already
+# correct). Any later device that signs in with the same email has its own local data merged
+# onto the canonical visitor_id, then adopts that canonical id for all future requests — so
+# waypoints, subscription, and view state all follow the account across every device/browser.
+# ------------------------------------------------------------------------------------------
+
+
+class AuthRequestBody(BaseModel):
+    email: str
+
+
+class AuthVerifyBody(BaseModel):
+    email: str
+    code: str
+
+
+async def _send_login_code_email(email: str, code: str) -> None:
+    if not RESEND_BASE:
+        raise HTTPException(500, "Email service isn't configured on the server yet")
+    resp = await http_client.post(
+        f"{RESEND_BASE}/emails",
+        headers=RESEND_KEY_HEADER,
+        json={
+            "from": RESTORE_FROM_EMAIL,
+            "to": [email],
+            "subject": f"{code} is your EScout sign-in code",
+            "text": (
+                f"Your EScout sign-in code is {code}.\n\n"
+                "Enter it in the app to sign in. It expires in 10 minutes. If you didn't "
+                "request this, you can ignore this email."
+            ),
+            "html": (
+                f"<p>Your EScout sign-in code is:</p>"
+                f"<p style='font-size:28px;font-weight:700;letter-spacing:4px'>{code}</p>"
+                "<p>Enter it in the app to sign in. It expires in 10 minutes. If you didn't "
+                "request this, you can ignore this email.</p>"
+            ),
+        },
+    )
+    if resp.status_code >= 400:
+        raise HTTPException(502, "Couldn't send the sign-in email — please try again shortly")
+
+
+async def _merge_visitor_into_account(old_vid: str, canonical_vid: str) -> None:
+    # Folds one device's local data onto the account's canonical visitor_id. Safe to call even
+    # when old_vid has nothing yet (brand-new device signing into an existing account) — every
+    # step is a targeted update/delete keyed on old_vid, so a device with no rows is a no-op.
+    if old_vid == canonical_vid:
+        return
+    await supabase.table("waypoints").update({"visitor_id": canonical_vid}).eq("visitor_id", old_vid).execute()
+    await supabase.table("waypoint_shares").update({"visitor_id": canonical_vid}).eq("visitor_id", old_vid).execute()
+    await supabase.table("waypoint_share_grants").update({"recipient_vid": canonical_vid}).eq(
+        "recipient_vid", old_vid
+    ).execute()
+    await supabase.table("waypoint_share_grants").update({"owner_vid": canonical_vid}).eq(
+        "owner_vid", old_vid
+    ).execute()
+    await supabase.table("comp_grants").update({"redeemed_visitor_id": canonical_vid}).eq(
+        "redeemed_visitor_id", old_vid
+    ).execute()
+
+    old_sub_res = await supabase.table("subscriptions").select("*").eq("visitor_id", old_vid).limit(1).execute()
+    if old_sub_res.data:
+        old_sub = old_sub_res.data[0]
+        if (old_sub.get("tier") or "free") != "free":
+            canon_sub_res = (
+                await supabase.table("subscriptions").select("*").eq("visitor_id", canonical_vid).limit(1).execute()
+            )
+            canon_sub = canon_sub_res.data[0] if canon_sub_res.data else None
+            should_adopt = (
+                not canon_sub
+                or (canon_sub.get("tier") or "free") == "free"
+                or (old_sub.get("current_period_end") or 0) > (canon_sub.get("current_period_end") or 0)
+            )
+            if should_adopt:
+                await upsert_row(
+                    canonical_vid,
+                    stripe_customer_id=old_sub.get("stripe_customer_id"),
+                    stripe_subscription_id=old_sub.get("stripe_subscription_id"),
+                    tier=old_sub.get("tier"),
+                    state=old_sub.get("state"),
+                    status=old_sub.get("status"),
+                    current_period_end=old_sub.get("current_period_end"),
+                    source=old_sub.get("source"),
+                    comp_code=old_sub.get("comp_code"),
+                )
+        await supabase.table("subscriptions").delete().eq("visitor_id", old_vid).execute()
+
+    canon_view_res = await supabase.table("view_state").select("visitor_id").eq("visitor_id", canonical_vid).limit(
+        1
+    ).execute()
+    if not canon_view_res.data:
+        old_view_res = await supabase.table("view_state").select("*").eq("visitor_id", old_vid).limit(1).execute()
+        if old_view_res.data:
+            row = dict(old_view_res.data[0])
+            row["visitor_id"] = canonical_vid
+            await supabase.table("view_state").upsert(row).execute()
+    await supabase.table("view_state").delete().eq("visitor_id", old_vid).execute()
+
+
+@app.get("/api/auth/status")
+async def auth_status(request: Request):
+    # Lets the frontend silently confirm sign-in state from the durable vid cookie/query param
+    # instead of asking for email again on every load, as long as the device is already linked.
+    vid = request.state.vid
+    res = await supabase.table("accounts").select("email").eq("visitor_id", vid).limit(1).execute()
+    if res.data:
+        return {"signedIn": True, "email": res.data[0]["email"]}
+    return {"signedIn": False}
+
+
+@app.post("/api/auth/request-code")
+async def auth_request_code(body: AuthRequestBody, request: Request):
+    await rate_limit(f"auth_req_ip:{client_ip(request)}", limit=5, window_seconds=60)
+    email = (body.email or "").strip().lower()
+    if not email or "@" not in email or len(email) > 254:
+        raise HTTPException(400, "Enter a valid email address")
+    await rate_limit(f"auth_req_email:{email}", limit=3, window_seconds=600)
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    now = int(time.time())
+    await supabase.table("restore_codes").insert({
+        "email": email,
+        "code_hash": _hash_restore_code(email, code),
+        "vid": request.state.vid,
+        "attempts": 0,
+        "expires_at": now + RESTORE_CODE_TTL_SECONDS,
+        "created_at": now,
+        "purpose": "login",
+    }).execute()
+    await _send_login_code_email(email, code)
+    return {"sent": True}
+
+
+@app.post("/api/auth/verify-code")
+async def auth_verify_code(body: AuthVerifyBody, request: Request):
+    await rate_limit(f"auth_confirm:{client_ip(request)}", limit=10, window_seconds=60)
+    vid = request.state.vid
+    email = (body.email or "").strip().lower()
+    code = (body.code or "").strip()
+    if not email or "@" not in email:
+        raise HTTPException(400, "Enter a valid email address")
+    if not code:
+        raise HTTPException(400, "Enter the code from your email")
+
+    now = int(time.time())
+    res = (
+        await supabase.table("restore_codes")
+        .select("id,code_hash,vid,attempts,expires_at,used_at")
+        .eq("email", email)
+        .eq("vid", vid)
+        .eq("purpose", "login")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    rows = res.data
+    row = rows[0] if rows else None
+    invalid = HTTPException(400, "That code is invalid or has expired — request a new one")
+    if not row or row.get("used_at") or row["expires_at"] < now:
+        raise invalid
+    if row["attempts"] >= RESTORE_MAX_CODE_ATTEMPTS:
+        raise HTTPException(429, "Too many incorrect attempts — request a new code")
+    if not secrets.compare_digest(row["code_hash"], _hash_restore_code(email, code)):
+        await (
+            supabase.table("restore_codes")
+            .update({"attempts": row["attempts"] + 1})
+            .eq("id", row["id"])
+            .execute()
+        )
+        raise invalid
+    await (
+        supabase.table("restore_codes")
+        .update({"used_at": now})
+        .eq("id", row["id"])
+        .execute()
+    )
+
+    acct_res = await supabase.table("accounts").select("email,visitor_id").eq("email", email).limit(1).execute()
+    if acct_res.data:
+        canonical_vid = acct_res.data[0]["visitor_id"]
+    else:
+        canonical_vid = vid
+        await supabase.table("accounts").insert(
+            {"email": email, "visitor_id": canonical_vid, "created_at": now}
+        ).execute()
+
+    if vid != canonical_vid:
+        await _merge_visitor_into_account(vid, canonical_vid)
+
+    response = JSONResponse({"ok": True, "visitorId": canonical_vid, "email": email})
+    # The client should switch to sending this vid going forward (as the durable `vid` query
+    # param — see ensure_visitor_id above), but also refresh the cookie fallback here in case
+    # of direct/local access that bypasses the proxy.
+    response.set_cookie(
+        VISITOR_COOKIE,
+        canonical_vid,
+        max_age=VISITOR_COOKIE_MAX_AGE,
+        path="/",
+        samesite="lax",
+        httponly=True,
+    )
+    return response
+
+
+# ------------------------------------------------------------------------------------------
 # Waypoints (dropped pins) — persisted per visitor, plus shareable links so a set of pins can
-# be shared onto another visitor's map without ever needing accounts or logins. Sharing is a
+# be shared onto another visitor's map. Sharing is a
 # LIVE, view-only grant (see waypoint_share_grants below), not a copy: the recipient always
 # sees the owner's current row, the owner can revoke access any time, and the recipient can
 # never edit or delete the original.
