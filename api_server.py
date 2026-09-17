@@ -1337,7 +1337,7 @@ class DisplayNameBody(BaseModel):
 WAYPOINT_COLUMNS = "id,visitor_id,type,lng,lat,label,note,confidence,created_at,shared_from"
 
 
-def _waypoint_dict(row: dict, view_only: bool = False) -> dict:
+def _waypoint_dict(row: dict, view_only: bool = False, owner_name: str | None = None) -> dict:
     return {
         "id": row["id"],
         "type": row["type"],
@@ -1349,6 +1349,7 @@ def _waypoint_dict(row: dict, view_only: bool = False) -> dict:
         "createdAt": row["created_at"],
         "sharedFrom": row["shared_from"],
         "viewOnly": view_only,
+        "ownerName": owner_name,
     }
 
 
@@ -1404,7 +1405,14 @@ async def list_waypoints(request: Request):
         shared_res = await supabase.table("waypoints").select(WAYPOINT_COLUMNS).in_(
             "id", shared_ids
         ).execute()
-        shared = [_waypoint_dict(r, view_only=True) for r in shared_res.data]
+        # Each shared row's own `visitor_id` IS the owner (a live view of the owner's row,
+        # never a copy) -- look up display names keyed on that to label each pin with who
+        # shared it, onX-style, every time the map loads.
+        owner_names = await _lookup_display_names([r["visitor_id"] for r in shared_res.data])
+        shared = [
+            _waypoint_dict(r, view_only=True, owner_name=owner_names.get(r["visitor_id"]))
+            for r in shared_res.data
+        ]
     return {"waypoints": own + shared}
 
 
@@ -1571,7 +1579,11 @@ async def accept_share(code: str, request: Request):
             },
             on_conflict="waypoint_id,recipient_vid",
         ).execute()
-    return {"waypoints": [_waypoint_dict(r, view_only=True) for r in rows], "ownLink": False, "ownerName": owner_name}
+    return {
+        "waypoints": [_waypoint_dict(r, view_only=True, owner_name=owner_name) for r in rows],
+        "ownLink": False,
+        "ownerName": owner_name,
+    }
 
 
 @app.get("/api/waypoints/{wp_id}/shares")
