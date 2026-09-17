@@ -183,9 +183,10 @@
   const USGS_TOPO_ATTR = 'USGS The National Map';
   // USGS 3DEP elevation ImageServer — dynamically renders real contour lines, from actual
   // lidar/DEM elevation data, as a transparent PNG overlay so contour lines are visible
-  // over ANY basemap, not baked into a single topo tile set.
-  const USGS_CONTOUR_SERVICE =
-    'https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage';
+  // over ANY basemap, not baked into a single topo tile set. Proxied + permanently cached
+  // through our own backend (see /api/tiles/contour in api_server.py and the escout-recolor
+  // protocol handler below) rather than called directly: the raw service renders each tile
+  // on the fly and can take several seconds to over ten seconds for a never-before-seen area.
   // A fixed 10ft interval is exactly right up close (parcel-level scouting) but is WAY too
   // dense once you're zoomed out over any real terrain: confirmed live at zoom 10 near
   // Holly Springs NF, the 10ft lines packed so tightly across that much ground distance
@@ -196,10 +197,9 @@
   // heavily-generalized preset, confirmed via direct export comparison to render only
   // major ridgelines/valleys instead of every small wrinkle) below the close-in threshold,
   // the original fine "Preset 10ft Contour Interval" at/above it. Both are real presets
-  // exposed by this ImageServer's own rasterFunctionInfos endpoint.
+  // exposed by this ImageServer's own rasterFunctionInfos endpoint — the backend validates
+  // the 'fine'/'coarse' choice this file sends against an allow-list of exactly those two.
   const CONTOUR_ZOOM_DETAIL_THRESHOLD = 14;
-  const USGS_CONTOUR_RULE_FINE = encodeURIComponent(JSON.stringify({ rasterFunction: 'Preset 10ft Contour Interval' }));
-  const USGS_CONTOUR_RULE_COARSE = encodeURIComponent(JSON.stringify({ rasterFunction: 'Contour Smoothed 25' }));
   const USGS_CONTOUR_ATTR = 'USGS 3DEP';
   // The service always renders contour lines as near-black pixels, which disappear into
   // shadows/tree cover on satellite imagery. Route the tile through the escout-recolor
@@ -1653,8 +1653,14 @@
     // so even a coarser interval would still look bold if drawn with the close-in treatment.
     // Zoomed in (parcel-level): the original fine 10ft interval with the full bold treatment.
     const isCoarseTier = z < CONTOUR_ZOOM_DETAIL_THRESHOLD;
-    const rule = isCoarseTier ? USGS_CONTOUR_RULE_COARSE : USGS_CONTOUR_RULE_FINE;
-    const realUrl = `${USGS_CONTOUR_SERVICE}?bbox=${bbox}&bboxSR=3857&imageSR=3857&size=256,256&format=png32&transparent=true&renderingRule=${rule}&f=image`;
+    // Routed through our own backend (see /api/tiles/contour in api_server.py) instead of
+    // calling elevation.nationalmap.gov directly: that service renders each tile on the fly
+    // from raw elevation data and can take several seconds to over ten seconds for a
+    // never-before-requested area, so the backend permanently caches every render in Postgres
+    // (via Supabase) the first time ANY user anywhere requests it -- every later request for
+    // that same z/bbox/rule, from any device, is a fast cached read instead of a slow re-render.
+    const rule = isCoarseTier ? 'coarse' : 'fine';
+    const realUrl = `${API}/api/tiles/contour?z=${z}&bbox=${encodeURIComponent(bbox)}&rule=${rule}`;
     const resp = await fetchWithRetry(realUrl);
     if (!resp.ok) throw new Error(`escout-recolor: tile fetch failed (${resp.status})`);
     const blob = await resp.blob();
