@@ -522,6 +522,7 @@
   const layerState = {
     property: true,
     public: false,
+    privateRoads: false,
     contours: false,
     slope: false,
     landcover: false,
@@ -715,7 +716,14 @@
       }
     }
   }
-  const VISITOR_ID = getOrCreateVisitorId();
+  // Captured BEFORE getOrCreateVisitorId() runs (that function creates the key if it's
+  // missing), so this tells us whether this device already had a visitor id from before
+  // the account-system gate shipped. Used to grant a grace-period banner instead of a hard
+  // sign-in wall to devices that predate mandatory accounts.
+  const HAD_EXISTING_VISITOR_ID = (() => {
+    try { return !!localStorage.getItem('escout_visitor_id'); } catch (e) { return false; }
+  })();
+  let VISITOR_ID = getOrCreateVisitorId();
   const API = 'https://escout-backend.onrender.com';
 
   // Cosmetic only: strip a launch-time `vid` back out of the visible address bar once
@@ -806,6 +814,179 @@
     }
     return res.json();
   }
+
+  /* ================================================================================
+     Account sign-in gate
+     --------------------------------------------------------------------------------
+     Reuses the same email-code flow as Restore Purchase (see /api/auth/* in
+     api_server.py) so waypoints, subscription, and view state all follow a signed-in
+     account instead of a per-device visitor id. Rollout is a grace period: devices
+     that already had a visitor id before this shipped (HAD_EXISTING_VISITOR_ID) get a
+     dismissible banner for ~2 weeks; brand-new devices get a hard, non-dismissible
+     gate immediately. After the cutoff, everyone gets the hard gate.
+     ================================================================================ */
+  const ACCOUNT_GATE_HARD_CUTOFF = Date.parse('2026-09-30T00:00:00Z');
+  const ACCOUNT_EMAIL_KEY = 'escout_account_email';
+  const ACCOUNT_BANNER_DISMISS_KEY = 'escout_auth_banner_dismissed_at';
+  const ACCOUNT_BANNER_SNOOZE_MS = 24 * 60 * 60 * 1000; // re-show the banner once a day
+
+  function getAccountEmail() {
+    try { return localStorage.getItem(ACCOUNT_EMAIL_KEY) || null; } catch (e) { return null; }
+  }
+  function setAccountEmail(email) {
+    try { localStorage.setItem(ACCOUNT_EMAIL_KEY, email); } catch (e) { /* ignore */ }
+  }
+
+  const authGateEl = document.getElementById('authGate');
+  const authGateClose = document.getElementById('authGateClose');
+  const authStepEmail = document.getElementById('authStepEmail');
+  const authStepCode = document.getElementById('authStepCode');
+  const authEmailInput = document.getElementById('authEmailInput');
+  const authEmailError = document.getElementById('authEmailError');
+  const authSendCodeBtn = document.getElementById('authSendCodeBtn');
+  const authCodeInput = document.getElementById('authCodeInput');
+  const authCodeError = document.getElementById('authCodeError');
+  const authVerifyBtn = document.getElementById('authVerifyBtn');
+  const authResendBtn = document.getElementById('authResendBtn');
+  const authChangeEmailBtn = document.getElementById('authChangeEmailBtn');
+  const authCodeEmailLabel = document.getElementById('authCodeEmailLabel');
+  const authBannerEl = document.getElementById('authBanner');
+  const authBannerSignIn = document.getElementById('authBannerSignIn');
+  const authBannerDismiss = document.getElementById('authBannerDismiss');
+
+  let authGateDismissible = false;
+  let authPendingEmail = '';
+
+  function showAuthGate({ dismissible }) {
+    authGateDismissible = !!dismissible;
+    authGateClose.hidden = !authGateDismissible;
+    authStepEmail.hidden = false;
+    authStepCode.hidden = true;
+    authEmailError.hidden = true;
+    authCodeError.hidden = true;
+    if (!authEmailInput.value) {
+      const remembered = getAccountEmail();
+      if (remembered) authEmailInput.value = remembered;
+    }
+    authGateEl.hidden = false;
+    setTimeout(() => authEmailInput.focus(), 50);
+  }
+  function hideAuthGate() {
+    authGateEl.hidden = true;
+  }
+  function showAuthBanner() {
+    try {
+      const dismissedAt = Number(localStorage.getItem(ACCOUNT_BANNER_DISMISS_KEY) || 0);
+      if (dismissedAt && Date.now() - dismissedAt < ACCOUNT_BANNER_SNOOZE_MS) return;
+    } catch (e) { /* ignore */ }
+    authBannerEl.hidden = false;
+  }
+  function hideAuthBanner() {
+    authBannerEl.hidden = true;
+  }
+
+  function setAuthBusy(busy) {
+    authSendCodeBtn.disabled = busy;
+    authVerifyBtn.disabled = busy;
+  }
+
+  authSendCodeBtn.addEventListener('click', () => { sendLoginCode(); });
+  authEmailInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendLoginCode(); });
+  authCodeInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') verifyLoginCode(); });
+  authVerifyBtn.addEventListener('click', () => { verifyLoginCode(); });
+  authResendBtn.addEventListener('click', () => { sendLoginCode(true); });
+  authChangeEmailBtn.addEventListener('click', () => {
+    authStepCode.hidden = true;
+    authStepEmail.hidden = false;
+    authEmailError.hidden = true;
+    setTimeout(() => authEmailInput.focus(), 50);
+  });
+  authGateClose.addEventListener('click', () => { if (authGateDismissible) hideAuthGate(); });
+  authBannerSignIn.addEventListener('click', () => { showAuthGate({ dismissible: true }); });
+  authBannerDismiss.addEventListener('click', () => {
+    hideAuthBanner();
+    try { localStorage.setItem(ACCOUNT_BANNER_DISMISS_KEY, String(Date.now())); } catch (e) { /* ignore */ }
+  });
+
+  async function sendLoginCode(isResend) {
+    const email = authEmailInput.value.trim();
+    authEmailError.hidden = true;
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      authEmailError.textContent = 'Enter a valid email address.';
+      authEmailError.hidden = false;
+      return;
+    }
+    setAuthBusy(true);
+    try {
+      await apiFetch('/api/auth/request-code', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      });
+      authPendingEmail = email;
+      authCodeEmailLabel.textContent = email;
+      authStepEmail.hidden = true;
+      authStepCode.hidden = false;
+      authCodeError.hidden = true;
+      authCodeInput.value = '';
+      setTimeout(() => authCodeInput.focus(), 50);
+      if (isResend) toast('Code resent — check your inbox');
+    } catch (e) {
+      authEmailError.textContent = e.message || 'Could not send code. Try again.';
+      authEmailError.hidden = false;
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function verifyLoginCode() {
+    const code = authCodeInput.value.trim();
+    authCodeError.hidden = true;
+    if (!/^\d{6}$/.test(code)) {
+      authCodeError.textContent = 'Enter the 6-digit code from your email.';
+      authCodeError.hidden = false;
+      return;
+    }
+    setAuthBusy(true);
+    try {
+      const data = await apiFetch('/api/auth/verify-code', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: authPendingEmail, code }),
+      });
+      setAccountEmail(data.email || authPendingEmail);
+      try { localStorage.setItem('escout_visitor_id', data.visitorId); } catch (e) { /* ignore */ }
+      // Full reload so every part of the app (map, waypoints, subscription, view state)
+      // re-initializes cleanly against the canonical account identity, rather than trying
+      // to patch dozens of already-loaded in-memory data structures in place.
+      window.location.reload();
+    } catch (e) {
+      authCodeError.textContent = e.message || 'That code didn\u2019t work. Try again.';
+      authCodeError.hidden = false;
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function initAccountGate() {
+    let status = { signedIn: false, email: null };
+    try {
+      status = await apiFetch('/api/auth/status');
+    } catch (e) { /* treat as signed out on any error */ }
+    if (status && status.signedIn) {
+      if (status.email) setAccountEmail(status.email);
+      hideAuthGate();
+      hideAuthBanner();
+      return;
+    }
+    const pastCutoff = Date.now() >= ACCOUNT_GATE_HARD_CUTOFF;
+    if (!HAD_EXISTING_VISITOR_ID || pastCutoff) {
+      showAuthGate({ dismissible: false });
+    } else {
+      showAuthBanner();
+    }
+  }
+  initAccountGate();
   async function loadSubscription() {
     try {
       const data = await apiFetch('/api/subscription');
@@ -953,17 +1134,48 @@
   // a problem, and the position follows the visitor across devices/reloads either way. ----
   let hasSavedView = false;
   let viewSaveTimer = null;
+  let viewSaveDirty = false; // true whenever a moved position hasn't been confirmed sent yet
+  function currentViewPayload() {
+    const c = map.getCenter();
+    return { lng: c.lng, lat: c.lat, zoom: map.getZoom() };
+  }
   function scheduleSaveViewState() {
+    viewSaveDirty = true;
     if (viewSaveTimer) clearTimeout(viewSaveTimer);
     viewSaveTimer = setTimeout(() => {
-      const c = map.getCenter();
+      viewSaveTimer = null;
       apiFetch('/api/view-state', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ lng: c.lng, lat: c.lat, zoom: map.getZoom() }),
-      }).catch(() => {}); // best-effort — a missed save just means the next moveend retries
+        body: JSON.stringify(currentViewPayload()),
+      }).then(() => { viewSaveDirty = false; })
+        .catch(() => {}); // best-effort — a missed save just means the next moveend retries
     }, 700);
   }
+  // iOS freezes JS almost immediately once a PWA is backgrounded (home button, app
+  // switch, screen lock) — often well inside the 700ms debounce above, so the normal
+  // fetch() save above never gets a chance to fire. That silently dropped every "last
+  // viewed position" save for anyone whose habit is glance-then-background, which always
+  // reads as "the app never remembers where I was" (it falls back to the hardcoded
+  // CENTER every time). navigator.sendBeacon() is built for exactly this: the browser
+  // guarantees it attempts delivery even as the page is being torn down, unlike a
+  // regular fetch which iOS can simply cancel. Beacon can only POST and can't set custom
+  // headers, so the visitor id rides on the URL query string (the backend middleware
+  // already prefers that channel) and the backend accepts POST as an alias for PUT.
+  function flushViewStateOnHide() {
+    if (!viewSaveDirty) return;
+    if (viewSaveTimer) { clearTimeout(viewSaveTimer); viewSaveTimer = null; }
+    try {
+      const payload = JSON.stringify(currentViewPayload());
+      const url = `${API}/api/view-state?vid=${encodeURIComponent(VISITOR_ID)}`;
+      const ok = navigator.sendBeacon && navigator.sendBeacon(url, new Blob([payload], { type: 'application/json' }));
+      if (ok) viewSaveDirty = false;
+    } catch (e) { /* best-effort only */ }
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushViewStateOnHide();
+  });
+  window.addEventListener('pagehide', flushViewStateOnHide);
   async function loadAndApplySavedView() {
     try {
       const data = await apiFetch('/api/view-state');
@@ -996,34 +1208,186 @@
     }
   }
 
-  async function confirmSharedWaypointsReturn() {
-    // A pin-sharing link looks like ?wp=CODE (see the Share button in the Hunt Journal).
-    // Opening it once grants this visitor a LIVE, view-only link to those pins — they stay
-    // owned by whoever shared them, so edits/deletes on their end show up here automatically
-    // and this visitor can never edit, delete, or re-share them (see accept_share backend).
-    const params = new URLSearchParams(window.location.search);
-    const code = params.get('wp');
-    if (!code) return;
-    const cleanUrl = window.location.pathname;
-    window.history.replaceState({}, '', cleanUrl);
+  // Redeems a pin-share code against whichever storage context is currently running —
+  // shared by the ?wp=CODE URL flow and the manual "Have a shared pin link?" field in the
+  // Hunt Journal. The manual field matters for the same reason as the complimentary-code
+  // one above: a share link always opens in Safari (Messages/Mail can't launch an already-
+  // installed home-screen icon directly), and iOS gives that icon completely separate
+  // storage from Safari. So if the recipient already has EScout on their home screen, tapping
+  // the link only ever adds the pin to a brand-new Safari-only copy they don't normally use —
+  // it never appears in the app icon they actually open. Letting them paste the same link (or
+  // just the code) into this field from inside their installed app fixes that.
+  async function acceptSharedWaypointCode(code) {
+    if (!code) return false;
     try {
       const data = await apiFetch(`/api/waypoints/share/${encodeURIComponent(code)}/accept`, { method: 'POST' });
       if (data.ownLink) {
         toast("That's your own share link — those pins are already on your map");
-        return;
+        return true;
       }
       const created = data.waypoints || [];
       created.forEach((wp) => addSavedWaypointToMap(wp));
       if (activeTab === 'journal') renderJournal();
       if (created.length) {
-        toast(`Added ${created.length} shared pin${created.length === 1 ? '' : 's'} (view-only) to your map`);
+        const base = `Added ${created.length} shared pin${created.length === 1 ? '' : 's'} (view-only) to your map`;
+        // Tapping a share link always opens in the browser, not an already-installed
+        // home-screen icon (iOS keeps those storage contexts separate) — so if this
+        // acceptance just happened in plain Safari/Chrome, the pin landed here, not in
+        // that icon. Flag it so it doesn't look like the pin silently vanished.
+        const hint = !isStandalone()
+          ? ' — if you already have EScout installed, just open it — it’ll offer to add it there too'
+          : '';
+        toast(base + hint, hint ? 5200 : 2600);
         map.flyTo({ center: [created[0].lng, created[0].lat], zoom: 15.4, duration: 900 });
       } else {
         toast('This shared link has no pins to add');
       }
+      return true;
     } catch (e) {
       toast(e.message || 'This share link is invalid or has expired');
+      return false;
     }
+  }
+
+  // Pulls the `wp` code out of either a full pasted share link or a bare code string.
+  function extractShareCode(raw) {
+    const trimmed = (raw || '').trim();
+    if (!trimmed) return '';
+    try {
+      const asUrl = new URL(trimmed, window.location.origin);
+      const fromQuery = asUrl.searchParams.get('wp');
+      if (fromQuery) return fromQuery.trim();
+    } catch (e) {
+      // Not a URL — fall through and treat the whole string as a bare code.
+    }
+    return trimmed;
+  }
+
+  async function confirmSharedWaypointsReturn() {
+    // A pin-sharing link looks like ?wp=CODE (see the Share button in the Hunt Journal).
+    // onX-style: opening the link never grants access by itself — it previews the link
+    // (read-only, no grant created) and shows an Accept/Decline prompt. Only tapping
+    // Accept actually creates the LIVE, view-only grant (see acceptSharedWaypointCode).
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('wp');
+    if (!code) return;
+    const cleanUrl = window.location.pathname;
+    window.history.replaceState({}, '', cleanUrl);
+    // Tapping a share link always opens Safari, never an already-installed home-screen
+    // icon (iOS keeps those storage contexts completely separate), so priming the
+    // recipient's clipboard here means checkClipboardForSharedPin() can pick it up
+    // automatically the next time they open their installed EScout icon — no manual
+    // paste needed. Best-effort: some browsers block a clipboard write with no user
+    // gesture behind it, so this silently no-ops there and the manual "Have a shared
+    // pin link?" field still works as the fallback.
+    try { await navigator.clipboard.writeText(waypointShareLink(code)); } catch (e) { /* ignore */ }
+    await promptAcceptSharedWaypoints(code);
+  }
+
+  // Extracts a share code from clipboard text, but — unlike extractShareCode() used by the
+  // manual paste field — only when we're confident it's actually a share code: a URL with a
+  // `wp` query param, or a bare string matching our code format exactly (backend mints these
+  // via secrets.token_urlsafe(9), always 12 URL-safe base64 characters). This runs
+  // unprompted whenever the app opens/regains focus, so unlike the manual field (an explicit
+  // user action) it must never mistake an unrelated clipboard clipping — a phone number, an
+  // address, whatever the user last copied — for a share code and throw an unsolicited
+  // "invalid or expired" error.
+  function extractClipboardShareCode(raw) {
+    const trimmed = (raw || '').trim();
+    if (!trimmed) return '';
+    // Absolute URL with a `wp` query param (e.g. https://escouthunt.com/?wp=CODE). No base
+    // is passed here on purpose: with one, the URL constructor happily resolves almost any
+    // bare string as a *relative* reference instead of throwing, which would swallow the
+    // bare-code case below before it ever gets a chance to run.
+    try {
+      const asUrl = new URL(trimmed);
+      const fromQuery = (asUrl.searchParams.get('wp') || '').trim();
+      return /^[A-Za-z0-9_-]{10,14}$/.test(fromQuery) ? fromQuery : '';
+    } catch (e) {
+      // Not an absolute URL -- only accept it as a bare code if it matches our format
+      // exactly (backend mints these via secrets.token_urlsafe(9), always 12 URL-safe
+      // base64 characters), so unrelated clipboard text isn't mistaken for a share code.
+      return /^[A-Za-z0-9_-]{12}$/.test(trimmed) ? trimmed : '';
+    }
+  }
+
+  // Auto-detects a pending shared-pin link on the clipboard when the installed app opens —
+  // the fix for the gap above: since iOS can never launch this installed icon directly from
+  // a Messages/Mail link, this is what actually gets a shared pin into the copy of EScout
+  // someone actually uses, without them needing to know about (or find) the manual "Have a
+  // shared pin link?" field. Only runs standalone (installed) — a plain browser tab already
+  // handles ?wp= links directly via confirmSharedWaypointsReturn(). Reads are wrapped
+  // defensively: Safari can withhold clipboard access silently (no gesture, no prior grant),
+  // and that must degrade to "do nothing" rather than an error.
+  let __lastClipboardWpCode = null;
+  try { __lastClipboardWpCode = localStorage.getItem('escout_last_clipboard_wp_code'); } catch (e) { /* ignore */ }
+  async function checkClipboardForSharedPin() {
+    if (!isStandalone()) return;
+    if (!navigator.clipboard || !navigator.clipboard.readText) return;
+    let text;
+    try {
+      text = await navigator.clipboard.readText();
+    } catch (e) {
+      return; // no permission / no gesture behind us -- fail silently
+    }
+    const code = extractClipboardShareCode(text);
+    if (!code || code === __lastClipboardWpCode) return;
+    // Record it as "seen" before the user even decides Accept/Decline, so re-focusing the
+    // app doesn't re-show the same prompt on a loop while that link is still on the clipboard.
+    __lastClipboardWpCode = code;
+    try { localStorage.setItem('escout_last_clipboard_wp_code', code); } catch (e) { /* ignore */ }
+    await promptAcceptSharedWaypoints(code);
+  }
+
+  // Previews a share code (no grant created) and, unless it's the visitor's own link,
+  // shows the Accept/Decline modal before anything is recorded server-side.
+  async function promptAcceptSharedWaypoints(code) {
+    // Guards against the clipboard auto-check (checkClipboardForSharedPin) firing again
+    // — e.g. a rapid focus/visibilitychange double-fire — while this same modal is already
+    // open and mid-flow; without this a second call would attach a duplicate set of
+    // Accept/Decline listeners to the same modal.
+    const existingModal = document.getElementById('acceptShareModal');
+    if (existingModal && existingModal.classList.contains('open')) return;
+    let preview;
+    try {
+      preview = await apiFetch(`/api/waypoints/share/${encodeURIComponent(code)}`);
+    } catch (e) {
+      toast(e.message || 'This share link is invalid or has expired');
+      return;
+    }
+    if (preview.ownLink) {
+      toast("That's your own share link — those pins are already on your map");
+      return;
+    }
+    if (!preview.count) {
+      toast('This shared link has no pins to add');
+      return;
+    }
+    const modal = document.getElementById('acceptShareModal');
+    const desc = document.getElementById('acceptShareDesc');
+    desc.textContent = `A hunter shared ${preview.count} pin${preview.count === 1 ? '' : 's'} with you`;
+    modal.classList.add('open');
+    const acceptBtn = document.getElementById('acceptShareBtn');
+    const declineBtn = document.getElementById('declineShareBtn');
+    const cleanup = () => {
+      modal.classList.remove('open');
+      acceptBtn.removeEventListener('click', onAccept);
+      declineBtn.removeEventListener('click', onDecline);
+      modal.removeEventListener('click', onBackdrop);
+    };
+    const onAccept = async () => {
+      acceptBtn.disabled = true;
+      acceptBtn.textContent = 'Adding\u2026';
+      await acceptSharedWaypointCode(code);
+      acceptBtn.disabled = false;
+      acceptBtn.textContent = 'Accept';
+      cleanup();
+    };
+    const onDecline = () => cleanup();
+    const onBackdrop = (e) => { if (e.target === modal) cleanup(); };
+    acceptBtn.addEventListener('click', onAccept);
+    declineBtn.addEventListener('click', onDecline);
+    modal.addEventListener('click', onBackdrop);
   }
 
   // ---- Sharing dropped pins with other visitors ----
@@ -1081,13 +1445,35 @@
       list.innerHTML = '<li class="share-access-empty">Couldn\u2019t load who has access.</li>';
     }
   }
-  async function copyShareLink(text) {
+  async function copyText(text, message) {
     try {
       await navigator.clipboard.writeText(text);
-      toast('Link copied');
+      toast(message || 'Copied');
     } catch (e) {
       toast('Could not copy — select and copy manually');
     }
+  }
+  function copyShareLink(text) {
+    return copyText(text, 'Link copied');
+  }
+  // Share the app itself (not a pin/waypoint) with a friend — native share sheet where
+  // available (mobile Safari/PWA), falling back to copying the plain app link on desktop.
+  async function shareApp() {
+    const url = window.location.origin + window.location.pathname;
+    if (navigator.share) {
+      try {
+        await navigator.share({
+          title: 'EScout',
+          text: 'EScout — AI hunting maps with public land data, satellite imagery, and Scout AI. Check it out:',
+          url,
+        });
+        return;
+      } catch (e) {
+        if (e && e.name === 'AbortError') return; // user cancelled the share sheet — not an error
+        // any other failure falls through to the clipboard copy below
+      }
+    }
+    copyText(url, 'App link copied — send it to a friend!');
   }
   async function shareWaypoints(ids) {
     try {
@@ -1119,6 +1505,9 @@
     return hasPremiumAccess();
   }
   function hasTopoAccess() {
+    return hasPremiumAccess();
+  }
+  function hasPrivateRoadsAccess() {
     return hasPremiumAccess();
   }
   const pricingModal = document.getElementById('pricingModal');
@@ -1772,18 +2161,154 @@
     });
   })();
   // "Go to current location" — built-in geolocate control: on click, centers/zooms to the
-  // device's GPS position and keeps a live pulsing dot on the map while tracking.
+  // device's GPS position and keeps a live pulsing dot on the map while tracking. Heading is
+  // handled by our own cone below instead of the stock arrow (see showUserHeading: false).
   const geolocateControl = new maplibregl.GeolocateControl({
     positionOptions: { enableHighAccuracy: true },
     trackUserLocation: true,
-    showUserHeading: true,
+    showUserHeading: false,
     showAccuracyCircle: true,
     fitBoundsOptions: { maxZoom: 17 },
   });
   map.addControl(geolocateControl, 'bottom-right');
+
+  // ---- Directional heading cone: which way the phone is physically pointing, onX-style. ----
+  // GPS "course" (coords.heading) only updates while you're physically moving — useless for
+  // glassing a field or checking a shot lane while standing still. The compass/magnetometer
+  // (deviceorientation) updates live as you simply turn the phone in your hand, which is what
+  // hunters actually want here, so the cone is driven by that instead.
+  const headingConeEl = document.createElement('div');
+  headingConeEl.className = 'escout-heading-cone';
+  headingConeEl.innerHTML = `
+    <svg viewBox="0 0 200 200" aria-hidden="true">
+      <defs>
+        <radialGradient id="escout-cone-grad" cx="50%" cy="50%" r="48%">
+          <stop offset="0%" stop-color="#eaf7d8" stop-opacity="0.9"/>
+          <stop offset="35%" stop-color="var(--color-primary)" stop-opacity="0.65"/>
+          <stop offset="75%" stop-color="var(--color-primary)" stop-opacity="0.32"/>
+          <stop offset="100%" stop-color="var(--color-primary)" stop-opacity="0"/>
+        </radialGradient>
+      </defs>
+      <path d="M 100 100 L 55 28 A 85 85 0 0 1 145 28 Z" fill="url(#escout-cone-grad)" stroke="rgba(255,255,255,0.85)" stroke-width="3" stroke-linejoin="round"/>
+    </svg>`;
+  headingConeEl.style.display = 'none';
+  const headingConeMarker = new maplibregl.Marker({
+    element: headingConeEl,
+    // 'center' anchor puts the marker box's rotation origin exactly on the GPS position —
+    // 'bottom' would rotate around the box's own center, swinging the wedge's vertex away
+    // from the dot as heading changes (confirmed visually: south/west headings drifted the
+    // whole shape off the fix). The wedge's own vertex is drawn at the SVG's center (see path
+    // above) so it stays glued to the dot through every rotation.
+    anchor: 'center',
+    rotationAlignment: 'map',
+    pitchAlignment: 'map',
+    rotation: 0,
+  });
+  let headingConeAdded = false;
+  let lastHeadingAt = 0;
+  let headingModeEnabled = false; // only true after the user taps the locate button a 2nd time
+  let isTracking = false; // mirrors the GeolocateControl's own on/off state
+  const HEADING_STALE_MS = 6000; // hide the cone if compass updates stop (e.g. permission revoked mid-session)
+  function setHeadingCone(headingDeg) {
+    lastHeadingAt = Date.now();
+    // Marker.setRotation with rotationAlignment:'map' rotates clockwise from north (MapLibre's
+    // documented convention), and our SVG wedge points north (up) at rotation 0 — so the raw
+    // compass heading (already clockwise-from-north, see handleDeviceOrientation) is passed
+    // straight through with no inversion. An earlier build negated this heading based on a
+    // simulated-browser test that turned out to be misleading (confounded by the anchor bug
+    // below); real-device testing showed that "fix" actually pointed the cone backwards, so it
+    // has been reverted to match the library's documented, standard behavior.
+    headingConeMarker.setRotation(headingDeg % 360);
+    headingConeEl.style.display = '';
+  }
+  setInterval(() => {
+    if (lastHeadingAt && Date.now() - lastHeadingAt > HEADING_STALE_MS) headingConeEl.style.display = 'none';
+  }, 2000);
+  function handleDeviceOrientation(event) {
+    if (!headingModeEnabled) return; // ignore compass events until the user explicitly asks for the cone
+    let heading;
+    if (typeof event.webkitCompassHeading === 'number' && !isNaN(event.webkitCompassHeading)) {
+      heading = event.webkitCompassHeading; // iOS Safari: already a true compass heading, clockwise from North
+    } else if (event.absolute && typeof event.alpha === 'number') {
+      heading = 360 - event.alpha; // Android deviceorientationabsolute: alpha runs counter-clockwise from North
+    } else {
+      return; // no usable heading on this event/browser — leave the cone hidden
+    }
+    let screenAngle = 0;
+    try { screenAngle = (screen.orientation && typeof screen.orientation.angle === 'number') ? screen.orientation.angle : (window.orientation || 0); } catch (e) { /* ignore */ }
+    setHeadingCone((heading + screenAngle + 360) % 360);
+  }
+  window.addEventListener('deviceorientationabsolute', handleDeviceOrientation);
+  window.addEventListener('deviceorientation', handleDeviceOrientation);
+  async function requestCompassPermission() {
+    // iOS 13+ gates DeviceOrientationEvent behind an explicit user-gesture permission prompt;
+    // Android/desktop fire the event with no prompt needed, so this just resolves instantly there.
+    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+      try { await DeviceOrientationEvent.requestPermission(); } catch (e) { /* denied/unsupported — cone just won't show */ }
+    }
+  }
+  // A returning user's location often auto-resumes on load (see the 'granted' permission check
+  // below), so we can't count "taps" by watching MapLibre's own on/off state — by the time a user
+  // taps at all, tracking may already be active. Instead we fully take over the button ourselves
+  // while heading mode is off: every tap is captured and counted by us, and we drive geolocation
+  // manually via geolocateControl.trigger() (MapLibre's own public API for this). Only once the
+  // 2nd deliberate tap has enabled heading mode do we step aside and let MapLibre's native click
+  // handling run again (so a further tap behaves like the normal "stop tracking" toggle).
+  // We still capture-intercept on an ancestor (not the button itself): same-element listeners run
+  // in registration order regardless of capture, so a listener added directly on the button could
+  // not reliably run before MapLibre's own.
+  const geolocateButtonEl = map.getContainer().querySelector('.maplibregl-ctrl-geolocate');
+  let manualTapCount = 0;
+  let hasShownHeadingHint = false;
+  if (geolocateButtonEl) {
+    map.getContainer().addEventListener('click', (e) => {
+      if (!(e.target === geolocateButtonEl || geolocateButtonEl.contains(e.target))) return;
+      if (headingModeEnabled) return; // heading already on — let this and later clicks behave normally
+      manualTapCount += 1;
+      if (isTracking) {
+        // Native default action for this click would be to STOP tracking (control is already ON,
+        // e.g. because the auto-resume above already started it for a returning user, or because
+        // an earlier deliberate tap started it). We never call trigger() ourselves here — it
+        // reproduces MapLibre's own click-toggle exactly, so calling it while already active/
+        // pending just turns tracking off. Instead we simply swallow the click so the native
+        // stop-tracking action never runs, until the 2nd deliberate tap, when we turn on heading.
+        e.preventDefault();
+        e.stopPropagation();
+        if (manualTapCount >= 2) {
+          headingModeEnabled = true;
+          requestCompassPermission();
+        } else if (!hasShownHeadingHint) {
+          hasShownHeadingHint = true;
+          toast('Tap the location button again to show which way you\'re facing', 3200);
+        }
+      } else {
+        // Not tracking yet — let the native click handler run normally to start it. No need to
+        // intercept: there's nothing to protect against toggling off yet.
+        if (!hasShownHeadingHint) {
+          hasShownHeadingHint = true;
+          toast('Tap the location button again to show which way you\'re facing', 3200);
+        }
+      }
+    }, true);
+  }
+  function removeHeadingCone() {
+    if (headingConeAdded) { headingConeMarker.remove(); headingConeAdded = false; }
+    headingConeEl.style.display = 'none';
+    headingModeEnabled = false;
+    isTracking = false;
+    manualTapCount = 0;
+  }
+  geolocateControl.on('geolocate', (pos) => {
+    if (!pos || !pos.coords) return;
+    isTracking = true;
+    headingConeMarker.setLngLat([pos.coords.longitude, pos.coords.latitude]);
+    if (!headingConeAdded) { headingConeMarker.addTo(map); headingConeAdded = true; }
+  });
+  geolocateControl.on('trackuserlocationend', removeHeadingCone);
   geolocateControl.on('error', (err) => {
     const denied = err && err.code === 1;
     toast(denied ? 'Location access denied — enable it in your browser/device settings' : 'Could not get your current location', 3600);
+    removeHeadingCone();
   });
   // Auto-center on the user's location at launch, but only if location permission
   // has ALREADY been granted — never force a fresh permission prompt on open.
@@ -2004,6 +2529,47 @@
         },
         paint: { 'text-color': '#ffffff', 'text-halo-color': '#1a1006', 'text-halo-width': 1.4 },
       });
+    }
+    // Private roads / driveways (OpenStreetMap access=private ways) — a genuinely separate
+    // data source from escout-roads above: that's an attribute-less Esri raster that simply
+    // omits many private tracks outright, while this is a live vector GeoJSON source refreshed
+    // per-viewport from a backend Overpass proxy (see refreshPrivateRoads()/moveend below), so
+    // it can carry the access tag and render as its own distinct dashed style. Gated to a
+    // minimum zoom (see PRIVATE_ROADS_MIN_ZOOM) both to keep clutter down and because the
+    // backend refuses overly large bbox queries.
+    if (!map.getSource('escout-private-roads')) {
+      map.addSource('escout-private-roads', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+      map.addLayer({
+        id: 'escout-private-roads-casing',
+        type: 'line',
+        source: 'escout-private-roads',
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: { 'line-color': '#2a1500', 'line-width': 4.2, 'line-opacity': 0.85 },
+      });
+      map.addLayer({
+        id: 'escout-private-roads-line',
+        type: 'line',
+        source: 'escout-private-roads',
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: { 'line-color': '#ffb300', 'line-width': 2.2, 'line-dasharray': [2.2, 1.6] },
+      });
+      map.addLayer({
+        id: 'escout-private-roads-label',
+        type: 'symbol',
+        source: 'escout-private-roads',
+        minzoom: 14,
+        layout: {
+          'symbol-placement': 'line',
+          'text-field': ['coalesce', ['get', 'name'], 'Private Road'],
+          'text-font': ['Noto Sans Bold'],
+          'text-size': 11,
+          'text-letter-spacing': 0.02,
+        },
+        paint: { 'text-color': '#ffd166', 'text-halo-color': '#1a1006', 'text-halo-width': 1.3 },
+      });
+      setVis('escout-private-roads-casing', layerState.privateRoads && hasPrivateRoadsAccess());
+      setVis('escout-private-roads-line', layerState.privateRoads && hasPrivateRoadsAccess());
+      setVis('escout-private-roads-label', layerState.privateRoads && hasPrivateRoadsAccess());
     }
     // Lines & Area measure tool layers — re-added after every basemap switch (setStyle wipes
     // custom layers), then immediately repopulated with whatever the user had drawn.
@@ -2278,6 +2844,7 @@
   const LAYER_ICONS = {
     property: '<svg class="li" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3h18v18H3z" stroke-dasharray="3 2"/></svg>',
     public: '<svg class="li" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 21V9l8-6 8 6v12"/><path d="M9 21v-6h6v6"/></svg>',
+    privateRoads: '<svg class="li" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 20c4-10 12-12 16-16" stroke-dasharray="3 2.4"/><rect x="9" y="14" width="7" height="6" rx="1"/><path d="M11 20v-3a1.5 1.5 0 013 0v3"/></svg>',
     contours: '<svg class="li" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12c3-4 6 4 9 0s6 4 9 0"/><path d="M2 17c3-4 6 4 9 0s6 4 9 0"/></svg>',
     landcover: '<svg class="li" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M2 12h20" opacity="0"/><path d="M12 22c4-3 7-7 7-12a7 7 0 10-14 0c0 5 3 9 7 12z"/></svg>',
     water: '<svg class="li" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2s7 7.5 7 12a7 7 0 11-14 0c0-4.5 7-12 7-12z"/></svg>',
@@ -2289,7 +2856,12 @@
   const LAYER_DEFS = [
     { group: 'Property & Access', rows: [
       { id: 'property', title: 'Private Land Boundaries', desc: 'Nationwide parcel boundary lines (public cadastral records)', on: true, map: true },
-      { id: 'public', title: 'Public Land (USFS / WMA / USACE)', desc: 'National forest, wildlife area & Army Corps of Engineers bounds, highlighted in green', on: false, map: true },
+      { id: 'public', title: 'Public Land (USFS / WMA / USACE)', desc: 'National forest, wildlife area & Army Corps of Engineers bounds. Corps boundary may include private easements -- check on-site signage.', on: false, map: true },
+      // 'privateRoads' row intentionally hidden -- feature is built (source/layers/toggle/backend
+      // endpoint all exist below) but paused: public Overpass instances consistently refuse or
+      // time out requests from our backend's IP range, so it would only ever show "no results".
+      // Re-add this row once a reliable data path is in place (paid Overpass tier, or a
+      // pre-fetched static extract) -- everything else needs no other changes to come back online.
     ]},
     { group: 'Terrain', rows: [
       { id: 'contours', title: 'Topo Contours', desc: 'Elevation contour lines + streams/water (USGS)', on: false, map: true },
@@ -2310,6 +2882,7 @@
     panelBody.innerHTML = '';
     const propertyUnlocked = hasPropertyAccess();
     const topoUnlocked = hasTopoAccess();
+    const privateRoadsUnlocked = hasPrivateRoadsAccess();
     // Seasonal imagery lives here now instead of the topbar/search row, so it sits alongside
     // the other map-affecting toggles a hunter is already scanning through. It's a 3-way
     // pill choice rather than a plain on/off switch, so it's built by hand instead of going
@@ -2346,14 +2919,26 @@
       g.appendChild(t);
       group.rows.forEach((row) => {
         const r = document.createElement('div');
-        const locked = (row.id === 'property' && !propertyUnlocked) || (row.id === 'contours' && !topoUnlocked);
+        const locked = (row.id === 'property' && !propertyUnlocked) || (row.id === 'contours' && !topoUnlocked) || (row.id === 'privateRoads' && !privateRoadsUnlocked);
         r.className = 'layer-row' + (locked ? ' is-locked' : '');
         const control = locked
           ? `<span class="lock-pill"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 018 0v3"/></svg>Upgrade</span>`
           : `<button class="switch ${layerState[row.id] ? 'on' : ''}" data-layer="${row.id}" aria-label="Toggle ${row.title}"></button>`;
-        r.innerHTML = `${LAYER_ICONS[row.id] || ''}<div class="li-text"><div class="li-title">${row.title}</div><div class="li-desc">${row.desc}</div></div>${control}`;
+        // The wind row gets an extra chevron button that opens the full 72-hour forecast
+        // modal — distinct from the switch, which just shows/hides the header's current-wind
+        // chip (itself hidden on narrow/mobile screens, so the modal is the real feature here).
+        const openBtn = (!locked && row.id === 'wind')
+          ? `<button class="wf-open-btn" data-open-forecast aria-label="View 72-hour wind and thermal forecast"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg></button>`
+          : '';
+        r.innerHTML = `${LAYER_ICONS[row.id] || ''}<div class="li-text"><div class="li-title">${row.title}</div><div class="li-desc">${row.desc}</div></div>${openBtn}${control}`;
         if (locked) {
           r.addEventListener('click', () => openPricingModal());
+        } else if (row.id === 'wind') {
+          r.classList.add('is-clickable');
+          r.addEventListener('click', (e) => {
+            if (e.target.closest('.switch')) return;
+            openWindForecastModal();
+          });
         }
         g.appendChild(r);
       });
@@ -2380,6 +2965,20 @@
       if (on) {
         padusErrorToastShown = false;
         toast('Public land boundaries loading — look for bold green outlines in a few seconds. A viewport with no public/protected land nearby will simply show none.', 4600);
+        return;
+      }
+    }
+    if (id === 'privateRoads') {
+      const unlocked = hasPrivateRoadsAccess() && on;
+      setVis('escout-private-roads-casing', unlocked);
+      setVis('escout-private-roads-line', unlocked);
+      setVis('escout-private-roads-label', unlocked);
+      if (unlocked) {
+        if (map.getZoom() < PRIVATE_ROADS_MIN_ZOOM) {
+          toast('Zoom in closer to load private roads & driveways (OpenStreetMap data).', 4200);
+        } else {
+          refreshPrivateRoads();
+        }
         return;
       }
     }
@@ -2416,6 +3015,48 @@
   });
   function syncPropertyLayerVisibility() {
     setVis('escout-parcels-layer', layerState.property && hasPropertyAccess());
+  }
+
+  // ---- Private roads (OSM access=private) — refetched per-viewport from the backend's
+  // Overpass proxy (see /api/private-roads in api_server.py) whenever the toggle is on and
+  // the user pans/zooms. Debounced the same 700ms as scheduleSaveViewState above so a fast
+  // pan/zoom fling doesn't fire a request per intermediate frame, and every in-flight fetch
+  // is aborted before starting the next one so a slow response for an old viewport can never
+  // land after (and stomp) a newer one. ----
+  const PRIVATE_ROADS_MIN_ZOOM = 14; // close, parcel-level view only — same tier of zoom as Private Land Boundaries
+  let privateRoadsTimer = null;
+  let privateRoadsController = null;
+  let privateRoadsErrorToastShown = false;
+  function clearPrivateRoads() {
+    const src = map.getSource('escout-private-roads');
+    if (src) src.setData({ type: 'FeatureCollection', features: [] });
+  }
+  function refreshPrivateRoads() {
+    if (!layerState.privateRoads || !hasPrivateRoadsAccess()) return;
+    if (privateRoadsTimer) clearTimeout(privateRoadsTimer);
+    privateRoadsTimer = setTimeout(async () => {
+      privateRoadsTimer = null;
+      if (map.getZoom() < PRIVATE_ROADS_MIN_ZOOM) { clearPrivateRoads(); return; }
+      const b = map.getBounds();
+      const bbox = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()].map((v) => v.toFixed(5)).join(',');
+      if (privateRoadsController) privateRoadsController.abort();
+      privateRoadsController = new AbortController();
+      try {
+        const res = await fetch(`${API}/api/private-roads?bbox=${encodeURIComponent(bbox)}`, { signal: privateRoadsController.signal });
+        if (!res.ok) throw new Error('bad status');
+        const geojson = await res.json();
+        const src = map.getSource('escout-private-roads');
+        if (src) src.setData(geojson);
+        privateRoadsErrorToastShown = false;
+      } catch (e) {
+        if (e && e.name === 'AbortError') return; // superseded by a newer viewport, not a real failure
+        if (!privateRoadsErrorToastShown) {
+          privateRoadsErrorToastShown = true;
+          toast('Private roads data (OpenStreetMap) is having trouble loading right now — try panning again in a moment.', 4600);
+          setTimeout(() => { privateRoadsErrorToastShown = false; }, 30000);
+        }
+      }
+    }, 700);
   }
 
   /* ---- Trail cam markers ---- */
@@ -2521,6 +3162,50 @@
         });
       });
     }
+
+    // Manual "accept a shared pin link" entry — needed because a share link always opens in
+    // Safari, which iOS treats as separate storage from an already-installed home-screen
+    // EScout icon. Pasting the link (or just its code) in here works from inside that icon.
+    const acceptRow = document.createElement('div');
+    acceptRow.className = 'redeem-row wp-accept-row';
+    acceptRow.innerHTML =
+      '<button class="link-btn" type="button" id="wpAcceptToggle">Have a shared pin link?</button>' +
+      '<div class="redeem-form" id="wpAcceptForm" style="display:none;">' +
+      '<input class="redeem-input" id="wpAcceptInput" type="text" placeholder="Paste link or code" autocapitalize="off" autocorrect="off" spellcheck="false" />' +
+      '<button class="btn btn-ghost" id="wpAcceptSubmit" type="button">Add pin</button>' +
+      '</div>' +
+      '<p class="redeem-hint">If you already have EScout added to your Home Screen, opening someone\u2019s share link in Safari won\u2019t add it there \u2014 paste that same link here instead.</p>';
+    panelBody.appendChild(acceptRow);
+    const wpAcceptToggle = acceptRow.querySelector('#wpAcceptToggle');
+    const wpAcceptForm = acceptRow.querySelector('#wpAcceptForm');
+    const wpAcceptInput = acceptRow.querySelector('#wpAcceptInput');
+    const wpAcceptSubmit = acceptRow.querySelector('#wpAcceptSubmit');
+    wpAcceptToggle.addEventListener('click', () => {
+      const showing = wpAcceptForm.style.display !== 'none';
+      wpAcceptForm.style.display = showing ? 'none' : 'flex';
+      if (!showing) wpAcceptInput.focus();
+    });
+    const submitWpAccept = async () => {
+      const code = extractShareCode(wpAcceptInput.value);
+      if (!code) return;
+      wpAcceptSubmit.disabled = true;
+      const original = wpAcceptSubmit.textContent;
+      wpAcceptSubmit.textContent = 'Adding\u2026';
+      try {
+        const ok = await acceptSharedWaypointCode(code);
+        if (ok) {
+          wpAcceptInput.value = '';
+          wpAcceptForm.style.display = 'none';
+        }
+      } finally {
+        wpAcceptSubmit.disabled = false;
+        wpAcceptSubmit.textContent = original;
+      }
+    };
+    wpAcceptSubmit.addEventListener('click', submitWpAccept);
+    wpAcceptInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') submitWpAccept();
+    });
   }
 
   /* ---------------- Scout AI ---------------- */
@@ -2572,6 +3257,34 @@
   }
   const isCoverCat = (cat) => cat === 'forest' || cat === 'shrub' || cat === 'wetland';
   const isFieldCat = (cat) => cat === 'pasture' || cat === 'crop';
+  // How far a cell sits from the outer ring of the sampled grid, 0 (outer ring) to 1 (the
+  // innermost ring(s)). Two real effects otherwise push picks toward the literal edge of
+  // whatever area a hunter draws: (1) `localRelief`/`computeAspect` average fewer real
+  // neighbors for an edge cell (they're missing the off-grid side), which inflates variance
+  // and makes edge cells noisier/more likely to read as an extreme; (2) on any parcel with a
+  // general elevation trend (a hillside, a gentle slope — extremely common), the true min/max
+  // of a bounded sample of that trend sits at the sample window's boundary almost by
+  // definition. Both are real artifacts of "only this rectangle was sampled," not genuine
+  // terrain signal, and without a counterweight they reliably win over more genuinely
+  // representative interior picks whenever there's no field/water signal to override them.
+  function edgeDistFactor(cell) {
+    const half = Math.max(1, Math.floor((GRID_N - 1) / 2));
+    const rf = Math.min(cell.r, GRID_N - 1 - cell.r);
+    const cf = Math.min(cell.c, GRID_N - 1 - cell.c);
+    return Math.min(1, Math.min(rf, cf) / half);
+  }
+  // NLCD collapses deciduous/evergreen/mixed forest into one 'forest' category for every
+  // other check in this file (isCoverCat, edge detection, etc.) — that's still correct for
+  // those. But the raw code distinguishes real canopy type, and a hardwood/conifer boundary
+  // is a genuine, commonly-hunted edge (thermal conifer cover meeting hardwood mast/browse)
+  // that's otherwise invisible once collapsed. Keep it as a separate tag on the cell instead
+  // of changing `category`, so corridor detection can use it without touching anything else.
+  function forestTypeOf(code) {
+    if (code === 41) return 'deciduous';
+    if (code === 42) return 'evergreen';
+    if (code === 43) return 'mixed';
+    return null;
+  }
 
   // Every network call Scout AI makes gets a hard client-side timeout via AbortController.
   // Without this, a hung/reset connection to a government ArcGIS host (which has no fixed
@@ -2722,6 +3435,232 @@
     }
   }
 
+  /* ---------------- Moon phase engine ---------------- */
+  // Location-independent, computed purely from the date — no API/key needed. Uses the
+  // standard synodic-month model (known reference new moon + 29.530588853-day period) to
+  // get a phase fraction 0..1 (0/1 = new moon, 0.5 = full moon), then a cosine illumination
+  // model for the lit percentage. Accurate to well within a day, which is all a planning
+  // tool needs — this also replaces the header chip's old hardcoded "Waning · 38%" text,
+  // which never actually changed regardless of the real date.
+  const MOON_SYNODIC_MONTH = 29.530588853;
+  const MOON_KNOWN_NEW_MOON = Date.UTC(2000, 0, 6, 18, 14, 0);
+  function getMoonPhaseFraction(date) {
+    const diffDays = (date.getTime() - MOON_KNOWN_NEW_MOON) / 86400000;
+    let phase = (diffDays % MOON_SYNODIC_MONTH) / MOON_SYNODIC_MONTH;
+    if (phase < 0) phase += 1;
+    return phase;
+  }
+  function moonPhaseName(phase) {
+    if (phase < 0.02 || phase > 0.98) return 'New Moon';
+    if (phase < 0.24) return 'Waxing Crescent';
+    if (phase < 0.26) return 'First Quarter';
+    if (phase < 0.49) return 'Waxing Gibbous';
+    if (phase < 0.51) return 'Full Moon';
+    if (phase < 0.74) return 'Waning Gibbous';
+    if (phase < 0.76) return 'Last Quarter';
+    return 'Waning Crescent';
+  }
+  function moonIllumination(phase) {
+    return Math.round((1 - Math.cos(2 * Math.PI * phase)) / 2 * 100);
+  }
+  function moonHuntTip(phase) {
+    // Folk/solunar heuristic widely used by hunters: brighter overnight light lets deer
+    // satisfy more feeding needs after dark, which can quiet the last hour of legal light;
+    // darker nights push more of that feeding into daylight hours instead.
+    const pct = moonIllumination(phase);
+    if (pct >= 70) return 'Bright moonlight can let deer feed more overnight, sometimes quieting daylight movement — mornings are often your best bet.';
+    if (pct <= 20) return 'Little moonlight overnight often pushes more deer movement into daylight hours — good odds for all-day sits.';
+    return 'Moderate moonlight — deer movement should track fairly close to normal dawn/dusk patterns.';
+  }
+  let wfMoonIconSeq = 0;
+  function moonPhaseSVG(phase, size) {
+    // Two same-radius circles: a light "moon" disc and a masked-out "shadow" disc, whose
+    // horizontal offset traces the real waxing/waning cycle. dx=0 (shadow centered on the
+    // moon) = fully dark (new moon); dx=-2r (shadow shifted fully clear) = fully lit (full
+    // moon), moving left through the waxing half and back through the waning half so the lit
+    // sliver appears on the correct side for each half of the cycle.
+    const id = 'wf-moon-mask-' + (++wfMoonIconSeq);
+    const r = 10;
+    const dx = phase <= 0.5 ? -2 * r * (phase / 0.5) : -2 * r * (1 - (phase - 0.5) / 0.5);
+    const s = size || 20;
+    return `<svg viewBox="0 0 24 24" width="${s}" height="${s}" aria-hidden="true">
+      <defs><mask id="${id}"><rect width="24" height="24" fill="#fff"/><circle cx="${(12 + dx).toFixed(2)}" cy="12" r="${r}" fill="#000"/></mask></defs>
+      <circle cx="12" cy="12" r="${r}" fill="currentColor" opacity="0.16"/>
+      <circle cx="12" cy="12" r="${r}" fill="currentColor" mask="url(#${id})"/>
+      <circle cx="12" cy="12" r="${r}" fill="none" stroke="currentColor" stroke-opacity="0.35"/>
+    </svg>`;
+  }
+
+  /* ---------------- Moon HUD chip (header) ---------------- */
+  const moonHudIcon = document.getElementById('moonHudIcon');
+  const moonHudLabel = document.getElementById('moonHudLabel');
+  function refreshMoonHud() {
+    if (!moonHudLabel) return;
+    const phase = getMoonPhaseFraction(new Date());
+    moonHudLabel.textContent = `${moonPhaseName(phase)} · ${moonIllumination(phase)}%`;
+    if (moonHudIcon) moonHudIcon.innerHTML = moonPhaseSVG(phase, 18);
+  }
+  refreshMoonHud();
+  setInterval(refreshMoonHud, 60 * 60 * 1000); // phase drifts slowly; hourly refresh is plenty
+
+  /* ---------------- Wind & Thermal Forecast modal (real 72-hour outlook) ---------------- */
+  // The header chip above only ever shows the current instant's wind, and per
+  // `.hud-chip { display: none }` at <=560px it's hidden completely on phones — so on a
+  // real device, toggling the switch produced zero visible change. This modal is the actual
+  // feature the Intel row promises: an hourly wind outlook for the next 72 hours plus a
+  // thermal-drift estimate (rising during the day, falling in the evening/overnight), built
+  // from the same free, no-key Open-Meteo endpoint, and rendered in the same modal system
+  // used elsewhere in the app so it's guaranteed visible on any screen size.
+  const windForecastModal = document.getElementById('windForecastModal');
+  const wfDayTabs = document.getElementById('wfDayTabs');
+  const wfBody = document.getElementById('wfBody');
+  const WIND_ARROW_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v16m0 0l-5-5m5 5l5-5"/></svg>';
+  const COMPASS_DIRS = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
+  let wfForecastData = null; // { days: [{ date, sunrise, sunset, hours: [{time, speed, dir, compass}] }] }
+  let wfActiveDayIdx = 0;
+  let wfFetchToken = 0;
+
+  async function fetchWindForecast(lng, lat) {
+    const usp = new URLSearchParams({
+      latitude: lat, longitude: lng,
+      hourly: 'wind_speed_10m,wind_direction_10m',
+      daily: 'sunrise,sunset',
+      wind_speed_unit: 'mph', timezone: 'auto', forecast_days: '3',
+    });
+    const res = await fetchWithTimeout(`https://api.open-meteo.com/v1/forecast?${usp.toString()}`, 8000);
+    if (!res.ok) throw new Error('Wind forecast service error ' + res.status);
+    const data = await res.json();
+    if (!data.hourly || !data.daily) throw new Error('Malformed forecast response');
+    const dailyTimes = data.daily.time || [];
+    const sunrises = data.daily.sunrise || [];
+    const sunsets = data.daily.sunset || [];
+    const hTimes = data.hourly.time || [];
+    const hSpeed = data.hourly.wind_speed_10m || [];
+    const hDir = data.hourly.wind_direction_10m || [];
+    const days = dailyTimes.map((dateStr, i) => {
+      const hours = [];
+      hTimes.forEach((t, idx) => {
+        if (!t.startsWith(dateStr)) return;
+        const dir = hDir[idx];
+        const speed = hSpeed[idx];
+        if (speed == null || dir == null) return;
+        hours.push({ time: t, speed: Math.round(speed), dir, compass: COMPASS_DIRS[Math.round(dir / 22.5) % 16] });
+      });
+      return { date: dateStr, sunrise: sunrises[i] || null, sunset: sunsets[i] || null, hours };
+    });
+    return { days };
+  }
+
+  // Simple sunrise/sunset heuristic used by most hunting apps: thermals begin rising roughly
+  // 30 min after sunrise (as the ground warms) and reverse to falling roughly an hour before
+  // sunset (as it cools), continuing to fall until the next morning's transition. Real thermals
+  // vary with cloud cover, wind, and terrain — this is a planning estimate, not a live reading.
+  function computeThermalWindows(sunriseISO, sunsetISO, nextSunriseISO) {
+    if (!sunriseISO || !sunsetISO) return null;
+    const sunrise = new Date(sunriseISO);
+    const sunset = new Date(sunsetISO);
+    if (Number.isNaN(sunrise.getTime()) || Number.isNaN(sunset.getTime())) return null;
+    const risingStart = new Date(sunrise.getTime() + 30 * 60000);
+    const risingEnd = new Date(sunset.getTime() - 60 * 60000);
+    const nextSunrise = nextSunriseISO ? new Date(nextSunriseISO) : new Date(sunrise.getTime() + 24 * 3600000);
+    const fallingEnd = new Date(nextSunrise.getTime() + 30 * 60000);
+    return { risingStart, risingEnd, fallingStart: risingEnd, fallingEnd };
+  }
+
+  function wfFmtTime(d) { return d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' }); }
+  function wfFmtHour(iso) { return new Date(iso).toLocaleTimeString(undefined, { hour: 'numeric' }); }
+
+  function renderWindForecastDay(day, dayIdx, nextDay) {
+    const thermal = computeThermalWindows(day.sunrise, day.sunset, nextDay && nextDay.sunrise);
+    const now = new Date();
+    const moonPhase = getMoonPhaseFraction(new Date(day.date + 'T12:00:00Z'));
+    const moonHtml = `
+      <div class="wf-moon-card">
+        <div class="wf-moon-icon">${moonPhaseSVG(moonPhase, 34)}</div>
+        <div class="wf-moon-info">
+          <div class="wf-moon-name">${moonPhaseName(moonPhase)} <span class="wf-moon-pct">${moonIllumination(moonPhase)}% lit</span></div>
+          <div class="wf-moon-tip">${moonHuntTip(moonPhase)}</div>
+        </div>
+      </div>
+    `;
+    let hours = day.hours;
+    if (dayIdx === 0) hours = hours.filter((h) => new Date(h.time).getTime() >= now.getTime() - 30 * 60000);
+    const thermalHtml = thermal ? `
+      <div class="wf-thermal-row">
+        <div class="wf-thermal-card rising">
+          <div class="wf-thermal-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0l4-4m-4 4l-4-4"/><path d="M5 21h14"/></svg>Rising (upslope)</div>
+          <div class="wf-thermal-time">${wfFmtTime(thermal.risingStart)} – ${wfFmtTime(thermal.risingEnd)}</div>
+        </div>
+        <div class="wf-thermal-card falling">
+          <div class="wf-thermal-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21V9m0 0l4 4m-4-4l-4 4"/><path d="M5 3h14"/></svg>Falling (downslope)</div>
+          <div class="wf-thermal-time">${wfFmtTime(thermal.fallingStart)} – ${wfFmtTime(thermal.fallingEnd)}</div>
+        </div>
+      </div>
+      <p class="wf-thermal-tip">Warm air rises during the day, carrying your scent uphill — favor downhill approaches to a morning stand. It reverses near sunset and sinks downhill overnight, so plan evening access from uphill of where you expect deer.</p>
+    ` : '<p class="wf-thermal-tip">Sunrise/sunset data unavailable for this location.</p>';
+    const hourlyHtml = hours.length ? `
+      <div class="wf-hourly-heading">Hourly wind</div>
+      <div class="wf-hour-strip">
+        ${hours.map((h) => {
+          const hDate = new Date(h.time);
+          const isNow = Math.abs(hDate.getTime() - now.getTime()) < 30 * 60000;
+          return `<div class="wf-hour-cell${isNow ? ' is-now' : ''}">
+            <div class="wf-hour-time">${isNow ? 'Now' : wfFmtHour(h.time)}</div>
+            <div class="wf-hour-arrow" style="transform: rotate(${(h.dir + 180) % 360}deg)">${WIND_ARROW_SVG}</div>
+            <div class="wf-hour-speed">${h.speed}<span style="font-size:0.65em;">mph</span></div>
+            <div class="wf-hour-compass">${h.compass}</div>
+          </div>`;
+        }).join('')}
+      </div>
+    ` : '<p class="wf-thermal-tip">No hourly wind data available.</p>';
+    return moonHtml + thermalHtml + hourlyHtml;
+  }
+
+  function renderWindForecastTabs() {
+    if (!wfForecastData) return;
+    const labels = ['Today', 'Tomorrow', 'Day 3'];
+    wfDayTabs.innerHTML = wfForecastData.days.map((day, i) =>
+      `<button class="wf-day-tab${i === wfActiveDayIdx ? ' active' : ''}" data-day-idx="${i}">${labels[i] || day.date}</button>`
+    ).join('');
+    wfDayTabs.querySelectorAll('.wf-day-tab').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        wfActiveDayIdx = parseInt(btn.dataset.dayIdx, 10);
+        renderWindForecastTabs();
+        wfBody.innerHTML = renderWindForecastDay(wfForecastData.days[wfActiveDayIdx], wfActiveDayIdx, wfForecastData.days[wfActiveDayIdx + 1]);
+      });
+    });
+  }
+
+  async function openWindForecastModal() {
+    if (!windForecastModal) return;
+    windForecastModal.classList.add('open');
+    wfDayTabs.innerHTML = '';
+    wfBody.innerHTML = '<div class="wf-status">Loading forecast…</div>';
+    const c = map.getCenter();
+    const token = ++wfFetchToken;
+    try {
+      const forecast = await fetchWindForecast(c.lng, c.lat);
+      if (token !== wfFetchToken) return; // a newer open() superseded this fetch
+      wfForecastData = forecast;
+      wfActiveDayIdx = 0;
+      renderWindForecastTabs();
+      wfBody.innerHTML = renderWindForecastDay(forecast.days[0], 0, forecast.days[1]);
+    } catch (e) {
+      if (token !== wfFetchToken) return;
+      wfBody.innerHTML = '<div class="wf-status">Forecast unavailable right now — try again in a moment.</div>';
+    }
+  }
+  function closeWindForecastModal() {
+    if (windForecastModal) windForecastModal.classList.remove('open');
+  }
+  const windForecastCloseBtn = document.getElementById('windForecastClose');
+  if (windForecastCloseBtn) windForecastCloseBtn.addEventListener('click', closeWindForecastModal);
+  if (windForecastModal) {
+    windForecastModal.addEventListener('click', (e) => {
+      if (e.target === windForecastModal) closeWindForecastModal();
+    });
+  }
+
   /* ---------------- Selected-parcel scoping for Scout AI ---------------- */
   // When a hunter taps a specific parcel (Property Boundaries layer on), that parcel
   // becomes the active scan scope: Scout AI samples only inside its footprint and every
@@ -2839,18 +3778,93 @@
     const diag = frameDiagonalYards(bounds);
     return Math.max(MIN_PIN_SPACING_FLOOR_YDS, Math.min(MIN_PIN_SPACING_CEIL_YDS, diag * MIN_PIN_SPACING_FRACTION));
   }
-  // Walks a score-sorted candidate list and returns the first (i.e. highest-scoring) entry
-  // that keeps at least `minYards` from every already-placed pin in `avoidPts`. Falls back
-  // to the plain top-scoring entry if the frame is too small/sparse for any candidate to
-  // clear that spacing — a real but tightly-packed suggestion still beats no suggestion.
-  function pickSpaced(scoredArr, avoidPts, minYards, getLngLat) {
+
+  // ---------------- Spatial zoning ----------------
+  // Every scoring pass below (`buildFieldEdgeStand`, `buildBedding`, corridor ranking) sorts
+  // candidates by a real terrain score, but with `Array.prototype.sort` ties (very common —
+  // large stretches of uniform forest score identically once elevation/water/corridor data
+  // is missing or flat) resolve in original array order, which is always north-west-first
+  // (see `sampleGrid`'s row-major fill). That silently biased every pick toward whichever
+  // corner the grid happens to iterate first, and the old `pickSpaced` fallback
+  // (`spaced || scoredArr[0]`) gave up on real separation entirely whenever nothing cleared
+  // the minimum-yardage floor — which is exactly what produced picks stacked on the parcel
+  // border instead of spread across it. Zoning splits every in-parcel sample point into 3
+  // roughly equal, spatially coherent regions (deterministic k-means over real local-meter
+  // coordinates, not raw lng/lat, so it respects true distance) so the stand/bedding/
+  // corridor picks can be forced into 3 different parts of the property, not just 3
+  // different cells that happen to be a few dozen yards apart in the same corner.
+  function farthestPointSeeds(points, k) {
+    if (points.length <= k) return points.map((p) => p.slice());
+    const seeds = [points[0].slice()];
+    while (seeds.length < k) {
+      let best = null, bestD = -1;
+      points.forEach((p) => {
+        const d = Math.min(...seeds.map((s) => (p[0] - s[0]) ** 2 + (p[1] - s[1]) ** 2));
+        if (d > bestD) { bestD = d; best = p; }
+      });
+      seeds.push(best.slice());
+    }
+    return seeds;
+  }
+  function kmeans(points, k, iterations) {
+    if (!points.length) return [];
+    let centroids = farthestPointSeeds(points, k);
+    let assign = points.map(() => 0);
+    for (let iter = 0; iter < iterations; iter++) {
+      assign = points.map((p) => {
+        let bi = 0, bd = Infinity;
+        centroids.forEach((c, i) => {
+          const d = (p[0] - c[0]) ** 2 + (p[1] - c[1]) ** 2;
+          if (d < bd) { bd = d; bi = i; }
+        });
+        return bi;
+      });
+      const sums = centroids.map(() => [0, 0, 0]); // x, y, count
+      points.forEach((p, i) => { const a = assign[i]; sums[a][0] += p[0]; sums[a][1] += p[1]; sums[a][2]++; });
+      centroids = centroids.map((c, i) => (sums[i][2] ? [sums[i][0] / sums[i][2], sums[i][1] / sums[i][2]] : c));
+    }
+    return assign;
+  }
+  // Tags every in-parcel cell (mutates the shared cell objects, so every candidate list
+  // derived from `cells` — edge cells, interior cells, corridor cells — sees the same
+  // `.zone`) with a zone index 0/1/2. `origin` is `[lng, lat]` — the scanned frame's center,
+  // used so the local-meter projection stays accurate for whatever part of the country the
+  // scan is in.
+  function computeZones(cells, origin) {
+    const eligible = cells.filter((c) => c.inParcel);
+    if (eligible.length < 3) { eligible.forEach((c, i) => { c.zone = i; }); return; }
+    const pts = eligible.map((c) => toLocalMeters(origin, [c.lng, c.lat]));
+    const assign = kmeans(pts, 3, 8);
+    eligible.forEach((c, i) => { c.zone = assign[i]; });
+  }
+  // Chooses the best entry from a score-sorted candidate list while trying, in strict
+  // priority order, to (1) keep real-world separation from already-placed pins AND land in
+  // a zone not already claimed by another pick, (2) at least keep the spacing, (3) at least
+  // land in a fresh zone, (4) fall back to the plain top score. This is what actually makes
+  // the 3 results spread across the whole selected area instead of clustering wherever the
+  // scoring noise happens to peak first.
+  function pickDiverse(scoredArr, avoidPts, minYards, usedZones, getLngLat, getZone) {
     if (!scoredArr.length) return null;
-    if (!avoidPts || !avoidPts.length) return scoredArr[0];
-    const spaced = scoredArr.find((item) => {
+    // A pin that lands within this many yards of one already placed reads as the exact same
+    // spot on the map, not just "a bit close" — never worth showing even as a last resort.
+    const HARD_MIN_YDS = 15;
+    const distToNearestAvoid = (item) => {
+      if (!avoidPts || !avoidPts.length) return Infinity;
       const [lng, lat] = getLngLat(item);
-      return avoidPts.every((p) => yardsBetween(lat, lng, p[1], p[0]) >= minYards);
-    });
-    return spaced || scoredArr[0];
+      return Math.min(...avoidPts.map((p) => yardsBetween(lat, lng, p[1], p[0])));
+    };
+    const meetsSpacing = (item) => distToNearestAvoid(item) >= minYards;
+    const meetsZone = (item) => !usedZones || !usedZones.size || !usedZones.has(getZone(item));
+    const meetsHardFloor = (item) => distToNearestAvoid(item) >= HARD_MIN_YDS;
+    return (
+      scoredArr.find((item) => meetsSpacing(item) && meetsZone(item)) ||
+      scoredArr.find((item) => meetsSpacing(item)) ||
+      scoredArr.find((item) => meetsZone(item) && meetsHardFloor(item)) ||
+      scoredArr.find((item) => meetsHardFloor(item)) ||
+      // Every remaining candidate would land on or right next to an already-placed pin —
+      // better to show fewer, genuinely distinct results than stack two markers together.
+      null
+    );
   }
 
   async function sampleGrid(bounds, ring) {
@@ -2878,6 +3892,7 @@
         cell.code = lc ? lc.code : null;
         cell.label = lc ? lc.label : 'No data';
         cell.category = lc ? lcCategory(lc.code) : 'unknown';
+        cell.forestType = lc ? forestTypeOf(lc.code) : null;
         cell.elev = elev;
       })
     );
@@ -3066,7 +4081,7 @@
       else if (pick.wind.verdict === 'unfavorable') bits.push(`Fair warning: today's wind (${liveWind.compass} ${liveWind.speed}mph) is blowing your scent toward the field — better as a plan B on a different wind.`);
     }
     const conf = Math.max(64, Math.min(95, Math.round(76 + pick.score * 2)));
-    return { type: 'stand', name, conf, pt: [cell.lng, cell.lat], reason: bits.join(' ') };
+    return { type: 'stand', name, conf, pt: [cell.lng, cell.lat], zone: cell.zone, reason: bits.join(' ') };
   }
   function buildRidgeStand(cells, corridorCandidates, season) {
     const profile = seasonProfile(season);
@@ -3084,7 +4099,11 @@
       const heightScore = ((cell.elev - minElev) / spread) * 5;
       const relief = localRelief(cells, cell);
       const reliefScore = relief != null && relief > 0 ? Math.min(relief / 5, 3) : 0;
-      const interior = cell.r > 0 && cell.r < GRID_N - 1 && cell.c > 0 && cell.c < GRID_N - 1;
+      // Graduated, not binary: the outer ring is where fewer real neighbors get averaged
+      // into relief/aspect (noisier) and where a real hillside's sampled elevation extreme
+      // most often lands — so it takes a genuinely bigger height/relief edge to win from
+      // right at the boundary of the drawn area than from further inside it.
+      const interiorBonus = edgeDistFactor(cell) * 3;
       const nearestLow = nearestOfCategory(cells, cell, () => true, true);
       // Rut/late season weight corridor proximity more heavily here (bucks cruising terrain
       // funnels, or pressured deer sticking closer to travel routes) than early season, which
@@ -3097,7 +4116,7 @@
       }
       const wind = nearestLow ? windFavorability(cell.lng, cell.lat, nearestLow.cell.lng, nearestLow.cell.lat) : null;
       const windScore = wind ? (wind.verdict === 'favorable' ? 2 * profile.windWeight : wind.verdict === 'unfavorable' ? -2 * profile.windWeight : 0) : 0;
-      const score = heightScore + reliefScore + (interior ? 1.5 : 0) + corridorScore + windScore;
+      const score = heightScore + reliefScore + interiorBonus + corridorScore + windScore;
       return { cell, score, wind, corridorScore };
     }).sort((a, b) => b.score - a.score);
     const pick = scored[0].cell;
@@ -3116,10 +4135,11 @@
       name: 'Ridge Vantage Stand',
       conf: Math.max(60, Math.min(90, Math.round(68 + scored[0].score))),
       pt: [pick.lng, pick.lat],
+      zone: pick.zone,
       reason: bits.join(' '),
     };
   }
-  function buildBedding(cells, season, corridorCandidates, avoidPts, minSpacingYds) {
+  function buildBedding(cells, season, corridorCandidates, avoidPts, minSpacingYds, usedZones) {
     const profile = seasonProfile(season);
     const interior = cells.filter((c) => c.inParcel && isCoverCat(c.category) && !neighbors(cells, c).some((n) => isFieldCat(n.category)));
     if (!interior.length) return null;
@@ -3145,6 +4165,11 @@
       // Steeper, more broken ground reads as thicker/nastier — real bedding cover deer favor
       // specifically because hunters and other predators avoid it.
       if (aspect && aspect.grade > 8) score += 1.5;
+      // Genuine seclusion isn't just "away from a field" — it's away from the edge of
+      // whatever area was actually drawn/scanned. Without this, a spot with no field to
+      // measure distance from (a solid-timber tract) had zero seclusion signal at all, and
+      // sampling artifacts at the outer ring (see `edgeDistFactor`) could win by default.
+      score += edgeDistFactor(cell) * 1.8;
       // A slight bonus for sitting near — but not directly on — a likely travel corridor,
       // since real bedding areas open onto a corridor rather than floating in isolation.
       if (corridorCandidates && corridorCandidates.length) {
@@ -3153,7 +4178,10 @@
       }
       return { cell, score, aspect, water };
     }).sort((a, b) => b.score - a.score);
-    const best = pickSpaced(scored, avoidPts, minSpacingYds, (item) => [item.cell.lng, item.cell.lat]);
+    const best = pickDiverse(scored, avoidPts, minSpacingYds, usedZones, (item) => [item.cell.lng, item.cell.lat], (item) => item.cell.zone);
+    // Nothing distinct enough to add — every remaining candidate would sit right on top of
+    // an already-placed pin. Skip this result rather than render a duplicate marker.
+    if (!best) return null;
     const bits = [`Interior ${best.cell.label} sampled here, set back from any field edge in this view.`];
     if (best.aspect) {
       const isSouthish = best.aspect.faceBearing >= 100 && best.aspect.faceBearing <= 260;
@@ -3167,7 +4195,7 @@
         ? 'Tucked well off any field edge sampled in this view — with pressure and buck cruising both up this time of year, that extra seclusion matters more than it does early season.'
         : 'Tucked well off any field edge sampled in this view — the kind of seclusion deer look for to bed undisturbed.');
     }
-    return { type: 'bedding', name: `${best.cell.label} Interior Bedding`, conf: Math.max(62, Math.min(93, Math.round(72 + best.score * 2.4))), pt: [best.cell.lng, best.cell.lat], reason: bits.join(' ') };
+    return { type: 'bedding', name: `${best.cell.label} Interior Bedding`, conf: Math.max(62, Math.min(93, Math.round(72 + best.score * 2.4))), pt: [best.cell.lng, best.cell.lat], zone: best.cell.zone, reason: bits.join(' ') };
   }
   // Builds one ranked list of every corridor-shaped candidate in the grid — field pinches,
   // creek/wetland travel lanes, and terrain saddles/draws (now checked on both axes plus
@@ -3208,6 +4236,33 @@
       if (!onFieldEdge && relief != null && relief < -3 && coverNbs.length >= 2) {
         out.push({ type: 'corridor', name: 'Terrain Saddle Corridor', cell: c, score: (5 + Math.min(-relief / 4, 3)) * profile.corridorTerrainWeight,
           reason: `Elevation data shows this ${c.label} spot sits in a real low draw relative to the ground around it on ${coverNbs.length} sides — the path of least resistance through this terrain, and a likely travel route.${season === 'rut' ? ' Terrain funnels like this see heavy buck cruising traffic during the rut.' : season === 'late' ? ' Pressured, food-source-scarce deer fall back on terrain routes like this late in the season.' : ''}` });
+        return;
+      }
+      // Timber transition: this forest cell sits right where the sampled canopy type actually
+      // changes (deciduous/evergreen/mixed) — a real hardwood-vs-conifer edge, not just a
+      // generic "forest" blob. Deciduous<->evergreen is the strongest, most classic version
+      // (conifer thermal/security cover meeting hardwood mast and browse); a mixed-stand
+      // boundary is a softer version of the same edge, scored lower.
+      if (!onFieldEdge && c.category === 'forest' && c.forestType) {
+        const otherTypeNb = nbs.find((n2) => n2.category === 'forest' && n2.forestType && n2.forestType !== c.forestType);
+        if (otherTypeNb) {
+          const isHardConiferEdge = (c.forestType === 'evergreen' && otherTypeNb.forestType === 'deciduous') || (c.forestType === 'deciduous' && otherTypeNb.forestType === 'evergreen');
+          // Scored to genuinely compete with Terrain Saddle (max 8 base) and Field Pinch (9
+          // base) rather than always losing to them — live testing against real NLCD/elevation
+          // data across five actual timbered properties showed Timber Transition Edge was
+          // being correctly detected (sometimes a dozen+ real candidates per scan) but never
+          // once won the final corridor slot at its old 6.5/5 base scores, making the feature
+          // effectively invisible in practice despite working correctly under the hood.
+          const score = (isHardConiferEdge ? 11 : 9.5) * profile.corridorTerrainWeight;
+          const seasonNote = season === 'rut'
+            ? ' Bucks cruising through mixed timber lean on edges like this rather than committing to one canopy type, especially where conifer cover offers a quick bailout.'
+            : season === 'late'
+            ? (isHardConiferEdge ? ' With hardwood mast mostly gone and temperatures dropping, deer fall back on the conifer side for thermal cover but still work this edge to browse nearby.' : ' Late-season deer tuck into whichever side offers better thermal cover, using this edge to move between the two without crossing open ground.')
+            : (isHardConiferEdge ? ' Deer stage on the hardwood side to feed on mast/browse and duck into the conifer side for quick cover — a real, sampled edge between the two.' : ' A softer canopy transition than a hard conifer edge, but still a real seam between two distinct timber types deer key on.');
+          out.push({ type: 'corridor', name: 'Timber Transition Edge', cell: c,
+            score,
+            reason: `Canopy-type data shows this ${c.label} sits right where the forest shifts into ${otherTypeNb.label} nearby — a genuine timber-type edge, not just a guess at where "the woods change."${seasonNote}` });
+        }
       }
     });
     return out.sort((a, b) => b.score - a.score);
@@ -3217,7 +4272,7 @@
   // site — this is what actually ties the "corridor" pick to a real likely travel path
   // between the two other results, instead of surfacing an unrelated funnel elsewhere in
   // the frame.
-  function pickBestCorridor(candidates, biasSegment, avoidPts, minSpacingYds) {
+  function pickBestCorridor(candidates, biasSegment, avoidPts, minSpacingYds, usedZones) {
     if (!candidates.length) return null;
     const scored = candidates.map((cand) => {
       let score = cand.score;
@@ -3231,13 +4286,21 @@
     // being right on top of either endpoint — exactly the clustering this is meant to avoid.
     // Re-apply the same real-world spacing floor here so the winning corridor candidate is a
     // genuine midpoint-ish connector, not a duplicate of a pin already placed.
-    const picked = pickSpaced(scored, avoidPts, minSpacingYds, ({ cand }) => [cand.cell.lng, cand.cell.lat]);
+    const picked = pickDiverse(scored, avoidPts, minSpacingYds, usedZones, ({ cand }) => [cand.cell.lng, cand.cell.lat], ({ cand }) => cand.cell.zone);
+    // Nothing distinct enough to add — every remaining candidate would sit right on top of
+    // an already-placed pin. Skip this result rather than render a duplicate marker.
+    if (!picked) return null;
     const { cand: best, score: bestScore } = picked;
-    return { type: 'corridor', name: best.name, conf: Math.max(63, Math.min(94, Math.round(66 + bestScore * 2))), pt: [best.cell.lng, best.cell.lat], reason: best.reason + (biasSegment ? ' It also lines up closely with the direct line between the bedding area and the stand site above, reinforcing that this is a real connector between the two.' : '') };
+    return { type: 'corridor', name: best.name, conf: Math.max(63, Math.min(94, Math.round(66 + bestScore * 2))), pt: [best.cell.lng, best.cell.lat], zone: best.cell.zone, reason: best.reason + (biasSegment ? ' It also lines up closely with the direct line between the bedding area and the stand site above, reinforcing that this is a real connector between the two.' : '') };
   }
 
   async function analyzeViewport(bounds, season, ring) {
     const cells = await sampleGrid(bounds, ring);
+    // Zone every in-parcel cell into 3 spatially coherent regions BEFORE any scoring/picking
+    // happens, so the picks below can be forced apart across the whole selected area instead
+    // of clustering wherever scoring ties/noise happen to peak first (see `computeZones`).
+    const center = bounds.getCenter ? bounds.getCenter() : null;
+    computeZones(cells, center ? [center.lng, center.lat] : [cells[0]?.lng || 0, cells[0]?.lat || 0]);
     // hasField/hasCover only look at cells inside the selected parcel (or, with no
     // parcel selected, every cell is inParcel by default — same behavior as before).
     const usable = cells.filter((c) => c.inParcel && c.category !== 'unknown');
@@ -3249,13 +4312,18 @@
     if (hasCover) corridorCandidates = rankCorridorCandidates(cells, season);
     const stand = hasField ? buildFieldEdgeStand(cells, season) : buildRidgeStand(cells, corridorCandidates, season);
     if (stand) results.push(stand);
+    const usedZones = new Set();
+    if (stand && stand.zone != null) usedZones.add(stand.zone);
     let bedding = null;
     if (hasCover) {
-      bedding = buildBedding(cells, season, corridorCandidates, stand ? [stand.pt] : null, minSpacingYds);
-      if (bedding) results.push(bedding);
+      bedding = buildBedding(cells, season, corridorCandidates, stand ? [stand.pt] : null, minSpacingYds, usedZones);
+      if (bedding) {
+        results.push(bedding);
+        if (bedding.zone != null) usedZones.add(bedding.zone);
+      }
       const biasSegment = stand && bedding ? [stand.pt, bedding.pt] : null;
       const avoidPts = [stand, bedding].filter(Boolean).map((r) => r.pt);
-      const corridor = pickBestCorridor(corridorCandidates, biasSegment, avoidPts, minSpacingYds);
+      const corridor = pickBestCorridor(corridorCandidates, biasSegment, avoidPts, minSpacingYds, usedZones);
       if (corridor) results.push(corridor);
     }
     return { cells, usableCount: usable.length, hasField, hasCover, results };
@@ -3562,14 +4630,24 @@
       const marker = new maplibregl.Marker({ element: el }).setLngLat(r.pt).addTo(map);
       el.addEventListener('click', (ev) => {
         ev.stopPropagation();
-        new maplibregl.Popup({ offset: 18, maxWidth: '270px' })
+        const coordText = `${fmtCoord(r.pt[1])}, ${fmtCoord(r.pt[0])}`;
+        const coordsHtml =
+          '<div class="popup-coords">' +
+          `<span class="popup-coords-text">${escapeHtml(coordText)}</span>` +
+          `<button class="popup-coords-copy" type="button" data-scout-copycoords="${escapeHtml(coordText)}" aria-label="Copy coordinates">` +
+          '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>' +
+          '</button>' +
+          '</div>';
+        const popup = new maplibregl.Popup({ offset: 18, maxWidth: '270px' })
           .setLngLat(r.pt)
           .setHTML(
             `<div class="popup-title">${r.name}</div>` +
               `<div class="popup-desc"><strong>${TYPE_LABEL[r.type]}</strong> · <strong>${r.conf}%</strong> match confidence</div>` +
-              `<div class="popup-desc">${r.reason}</div>`
+              `<div class="popup-desc">${r.reason}</div>${coordsHtml}`
           )
           .addTo(map);
+        const copyCoordsBtn = popup.getElement().querySelector('[data-scout-copycoords]');
+        if (copyCoordsBtn) copyCoordsBtn.addEventListener('click', () => copyText(copyCoordsBtn.dataset.scoutCopycoords, 'Coordinates copied'));
       });
       resultMarkers.push(marker);
     });
@@ -4138,11 +5216,22 @@
     loading.setHTML(parcelPopupHtml(data));
   }
 
+  function fmtCoord(n) {
+    return (Math.round(n * 100000) / 100000).toFixed(5);
+  }
   function showWaypointPopup(record) {
     const def = wpDef(record.type);
     const confHtml = record.confidence != null ? `<div class="popup-desc"><strong>${escapeHtml(record.confidence)}%</strong> Scout AI match confidence</div>` : '';
     const noteHtml = record.note ? `<div class="popup-desc">${escapeHtml(record.note)}</div>` : '';
     const sharedTagHtml = record.viewOnly ? '<div class="popup-desc"><span class="tag shared-tag">Shared with you — view only</span></div>' : '';
+    const coordText = `${fmtCoord(record.lngLat.lat)}, ${fmtCoord(record.lngLat.lng)}`;
+    const coordsHtml =
+      '<div class="popup-coords">' +
+      `<span class="popup-coords-text">${escapeHtml(coordText)}</span>` +
+      `<button class="popup-coords-copy" type="button" data-wp-copycoords="${escapeHtml(coordText)}" aria-label="Copy coordinates">` +
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>' +
+      '</button>' +
+      '</div>';
     const btnRowHtml = record.viewOnly
       ? '<div class="popup-btn-row">' +
         `<button class="popup-delete-btn" type="button" data-wp-unshare="${record.id}">` +
@@ -4157,10 +5246,12 @@
     const popup = new maplibregl.Popup({ offset: 18, maxWidth: '270px' })
       .setLngLat(record.lngLat)
       .setHTML(
-        `<div class="popup-title">${escapeHtml(record.label)}</div><div class="popup-desc"><strong>${escapeHtml(def.label)}</strong></div>${confHtml}${noteHtml}${sharedTagHtml}${btnRowHtml}`
+        `<div class="popup-title">${escapeHtml(record.label)}</div><div class="popup-desc"><strong>${escapeHtml(def.label)}</strong></div>${confHtml}${noteHtml}${sharedTagHtml}${coordsHtml}${btnRowHtml}`
       )
       .addTo(map);
     // Delegate the click since the popup's DOM node is only created once .addTo() runs.
+    const copyCoordsBtn = popup.getElement().querySelector('[data-wp-copycoords]');
+    if (copyCoordsBtn) copyCoordsBtn.addEventListener('click', () => copyText(copyCoordsBtn.dataset.wpCopycoords, 'Coordinates copied'));
     const shareBtn = popup.getElement().querySelector('[data-wp-share]');
     if (shareBtn) shareBtn.addEventListener('click', () => shareWaypoints([record.id]));
     const deleteBtn = popup.getElement().querySelector('[data-wp-delete]');
@@ -4467,14 +5558,16 @@
     actionBtn.disabled = true;
     actionBtn.textContent = 'Install EScout';
     const { isIOS, isInAppBrowser, isChromeIOS, isFirefoxIOS, isEdgeIOS } = detectBrowserContext();
-    if (isIOS && isInAppBrowser) {
-      // Nothing to tap here — the install action genuinely doesn't exist in this context.
+    if (isInAppBrowser) {
+      // Nothing to tap here — Facebook/Instagram/etc. wrap the page in their own built-in
+      // browser, which never fires a native install prompt and (on iOS especially) has no
+      // "Add to Home Screen" action at all. The only real fix is backing out to Safari/Chrome.
       actionBtn.style.display = 'none';
-      statusText.textContent = "This link opened inside another app's built-in browser, which can't add anything to your Home Screen.";
+      statusText.textContent = "This link opened inside another app's built-in browser, which can't install EScout or add it to your Home Screen.";
       manualHint.innerHTML = stepsHTML([
         { icon: 'share', html: 'Tap the <strong>\u2022\u2022\u2022</strong> or <strong>share</strong> icon in this app\'s toolbar.' },
-        { icon: 'confirm', html: 'Choose <strong>"Open in Safari"</strong> (or "Open in Browser").' },
-        { icon: 'confirm', html: 'Once EScout opens in Safari, come back to this same screen and follow the Safari steps.' },
+        { icon: 'confirm', html: 'Choose <strong>"Open in Safari"</strong> (or <strong>"Open in Chrome"</strong> / "Open in Browser").' },
+        { icon: 'confirm', html: 'Once EScout opens in your real browser, come back to this same screen and follow the steps there.' },
       ]);
     } else if (isIOS && isChromeIOS) {
       statusText.textContent = 'Chrome on iPhone adds apps to your Home Screen manually:';
@@ -4554,8 +5647,9 @@
   // corner banner and no delay. It opens the instant the page is ready (this script runs
   // after the DOM has parsed), dead-center over a dimmed backdrop, with a brief amber glow
   // ring so it visually announces itself. Respects a "don't ask again for N days" dismissal
-  // in localStorage, and never appears once already running standalone/installed or inside
-  // an in-app browser where there's genuinely nothing to tap.
+  // in localStorage, and never appears once already running standalone/installed. It DOES
+  // still appear inside in-app browsers (Facebook, Instagram, etc.) — there it points people
+  // to "Open in Safari/Chrome" instead of showing the (unavailable) native install action.
   (function setupAutoInstallPrompt() {
     var DISMISS_KEY = 'escoutInstallPromptDismissedAt';
     var SNOOZE_DAYS = 14;
@@ -4603,9 +5697,33 @@
     var explicitInstallLink = new URLSearchParams(window.location.search).get('install') === '1';
     if (isStandalone()) return;
     if (!explicitInstallLink && recentlyDismissed()) return;
-    var ctx = detectBrowserContext();
-    if (ctx.isIOS && ctx.isInAppBrowser) return; // nothing actionable here — skip the nag
+    // In-app browsers (Facebook, Instagram, etc.) still get the modal — it now tells them to
+    // open the link in their real browser instead of silently showing nothing, which was the
+    // previous behavior and left people who tapped a shared link with no path to installing.
     openWithAttention();
+  })();
+
+  /* ---------------- Share-app button + "love the app" promo banner ----------------
+     A single global on/off switch the owner controls from /admin.html (see
+     /api/share-banner) — not a per-visitor preference. When active, every visitor sees
+     the "Love the app? Share it with a friend!" banner on this app load, and the Share
+     button (both the rail dock icon and the banner's own CTA) gets a pulsing highlight
+     for as long as the 5-day window runs. Fails silently (banner just stays hidden) if
+     the status check errors out — never blocks the rest of the app from loading. */
+  document.getElementById('shareAppBtn').addEventListener('click', () => shareApp());
+  document.getElementById('shareBannerActionBtn').addEventListener('click', () => shareApp());
+  document.getElementById('shareBannerClose').addEventListener('click', () => {
+    document.getElementById('shareBanner').classList.remove('show');
+  });
+  (async function setupShareBannerCampaign() {
+    try {
+      const data = await apiFetch('/api/share-banner');
+      if (!data || !data.active) return;
+      document.getElementById('shareAppBtn').classList.add('share-flash');
+      document.getElementById('shareBanner').classList.add('show');
+    } catch (e) {
+      /* status check failed — leave the banner hidden rather than nag on an error */
+    }
   })();
 
   /* ---------------- Share-pin modal ---------------- */
@@ -4619,6 +5737,35 @@
     input.select();
     copyShareLink(input.value);
   });
+  // Native share sheet (Messages/Mail/AirDrop/etc.) for pin links — mirrors onX's
+  // "Share with a Link" step, which hands the link straight to the OS share sheet
+  // instead of making the recipient pick it out of a copy-link box. Only shown where
+  // navigator.share exists (mobile Safari/Chrome, installed PWA) — desktop browsers
+  // fall back to the copy-link row below, which stays visible either way.
+  const shareNativeRow = document.getElementById('shareNativeRow');
+  const shareNativeBtn = document.getElementById('shareNativeBtn');
+  if (shareNativeRow && shareNativeBtn && navigator.share) {
+    shareNativeRow.style.display = '';
+    shareNativeBtn.addEventListener('click', async () => {
+      const input = document.getElementById('shareLinkInput');
+      const countEl = document.getElementById('shareModalCount');
+      const url = input.value;
+      if (!url) return;
+      const countMatch = countEl && /(\d+)/.exec(countEl.textContent || '');
+      const n = countMatch ? parseInt(countMatch[1], 10) : 1;
+      const shareText = n > 1 ? `Check out these ${n} pins I found in EScout:` : 'Check out this pin I found in EScout:';
+      try {
+        await navigator.share({
+          title: 'EScout pin',
+          text: shareText,
+          url,
+        });
+      } catch (e) {
+        if (e && e.name === 'AbortError') return; // user cancelled the share sheet — not an error
+        toast("Couldn't open the share sheet — use Copy link instead");
+      }
+    });
+  }
   document.getElementById('downloadSourceBtn').addEventListener('click', () => toast('Downloading EScout source (.zip)…'));
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
@@ -4880,6 +6027,7 @@
     // Keep the open panel (Intel acreage / Scout AI frame stat) in sync with the current
     // viewport for any tier that has map-dependent UI.
     refreshWindHud(); // no-op internally when the Wind & Thermal toggle is off
+    refreshPrivateRoads(); // no-op internally when the Private Roads toggle is off
     scheduleSaveViewState();
     if (subscription.tier === 'free') return;
     if (activeTab === 'intel') renderIntel();
@@ -4894,7 +6042,23 @@
   confirmCheckoutReturn()
     .then(() => confirmRedeemReturn())
     .then(() => confirmSharedWaypointsReturn())
+    .then(() => checkClipboardForSharedPin())
     .finally(() => loadSubscription());
+
+  // Re-check on every return to the installed app, the same way subscription state is kept
+  // fresh below — covers accepting a share link in Safari, background-switching straight to
+  // the home-screen icon, and finding the pin already offered instead of missing.
+  let __lastClipboardCheck = Date.now();
+  function checkClipboardIfStale() {
+    if (Date.now() - __lastClipboardCheck < 4000) return;
+    __lastClipboardCheck = Date.now();
+    checkClipboardForSharedPin();
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') checkClipboardIfStale();
+  });
+  window.addEventListener('focus', checkClipboardIfStale);
+  window.addEventListener('pageshow', (e) => { if (e.persisted) checkClipboardIfStale(); });
 
   // Checkout (and the billing portal) open in a separate tab — see startCheckout()/
   // openBillingPortal() above, opened via window.open('_blank') because the in-app preview
