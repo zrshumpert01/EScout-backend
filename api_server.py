@@ -1183,6 +1183,19 @@ async def _merge_visitor_into_account(old_vid: str, canonical_vid: str) -> None:
             await supabase.table("view_state").upsert(row).execute()
     await supabase.table("view_state").delete().eq("visitor_id", old_vid).execute()
 
+    canon_name_res = await supabase.table("display_names").select("visitor_id").eq(
+        "visitor_id", canonical_vid
+    ).limit(1).execute()
+    if not canon_name_res.data:
+        old_name_res = await supabase.table("display_names").select("*").eq("visitor_id", old_vid).limit(
+            1
+        ).execute()
+        if old_name_res.data:
+            row = dict(old_name_res.data[0])
+            row["visitor_id"] = canonical_vid
+            await supabase.table("display_names").upsert(row).execute()
+    await supabase.table("display_names").delete().eq("visitor_id", old_vid).execute()
+
 
 @app.get("/api/auth/status")
 async def auth_status(request: Request):
@@ -1317,6 +1330,10 @@ class ShareBody(BaseModel):
     ids: list[str] | None = None
 
 
+class DisplayNameBody(BaseModel):
+    name: str = Field(min_length=1, max_length=40)
+
+
 WAYPOINT_COLUMNS = "id,visitor_id,type,lng,lat,label,note,confidence,created_at,shared_from"
 
 
@@ -1423,6 +1440,52 @@ async def delete_waypoint(wp_id: str, request: Request):
     return {"deleted": True}
 
 
+def _clean_display_name(raw: str) -> str:
+    # Strip control characters and collapse whitespace -- this is shown directly to other
+    # visitors (share banners, access lists), so keep it to plain visible text.
+    cleaned = "".join(ch for ch in raw if ch.isprintable()).strip()
+    cleaned = " ".join(cleaned.split())
+    if not cleaned:
+        raise HTTPException(400, "Please enter a name")
+    return cleaned[:40]
+
+
+@app.get("/api/profile/name")
+async def get_display_name(request: Request):
+    # Optional, per-visitor display name shown only in pin-sharing contexts (never required to
+    # use the app). Keyed on visitor_id rather than account/email so it works the same whether
+    # or not the visitor has signed in yet.
+    vid = request.state.vid
+    res = await supabase.table("display_names").select("name").eq("visitor_id", vid).limit(1).execute()
+    return {"name": res.data[0]["name"] if res.data else None}
+
+
+@app.post("/api/profile/name")
+async def set_display_name(body: DisplayNameBody, request: Request):
+    await rate_limit(f"display-name:{client_ip(request)}", limit=30, window_seconds=60)
+    vid = request.state.vid
+    name = _clean_display_name(body.name)
+    now = int(time.time())
+    existing = await supabase.table("display_names").select("visitor_id").eq("visitor_id", vid).limit(1).execute()
+    if existing.data:
+        await supabase.table("display_names").update({"name": name, "updated_at": now}).eq(
+            "visitor_id", vid
+        ).execute()
+    else:
+        await supabase.table("display_names").insert(
+            {"visitor_id": vid, "name": name, "created_at": now, "updated_at": now}
+        ).execute()
+    return {"name": name}
+
+
+async def _lookup_display_names(vids: list[str]) -> dict[str, str]:
+    unique = list({v for v in vids if v})
+    if not unique:
+        return {}
+    res = await supabase.table("display_names").select("visitor_id,name").in_("visitor_id", unique).execute()
+    return {row["visitor_id"]: row["name"] for row in res.data}
+
+
 @app.post("/api/waypoints/share")
 async def share_waypoints(body: ShareBody, request: Request):
     vid = request.state.vid
@@ -1471,7 +1534,8 @@ async def preview_share(code: str, request: Request):
         raise HTTPException(404, "This share link is invalid or has expired")
     owner_vid = share_res.data[0]["visitor_id"]
     rows = await _load_shared_ordered(code)
-    return {"count": len(rows), "ownLink": owner_vid == request.state.vid}
+    owner_name = (await _lookup_display_names([owner_vid])).get(owner_vid)
+    return {"count": len(rows), "ownLink": owner_vid == request.state.vid, "ownerName": owner_name}
 
 
 @app.post("/api/waypoints/share/{code}/accept")
@@ -1490,9 +1554,10 @@ async def accept_share(code: str, request: Request):
         raise HTTPException(404, "This share link is invalid or has expired")
     owner_vid = share_res.data[0]["visitor_id"]
     rows = await _load_shared_ordered(code)
+    owner_name = (await _lookup_display_names([owner_vid])).get(owner_vid)
     if owner_vid == vid:
         # The sender opened their own link -- nothing to grant, these are already theirs.
-        return {"waypoints": [_waypoint_dict(r) for r in rows], "ownLink": True}
+        return {"waypoints": [_waypoint_dict(r) for r in rows], "ownLink": True, "ownerName": owner_name}
     now = int(time.time())
     for row in rows:
         await supabase.table("waypoint_share_grants").upsert(
@@ -1506,7 +1571,7 @@ async def accept_share(code: str, request: Request):
             },
             on_conflict="waypoint_id,recipient_vid",
         ).execute()
-    return {"waypoints": [_waypoint_dict(r, view_only=True) for r in rows], "ownLink": False}
+    return {"waypoints": [_waypoint_dict(r, view_only=True) for r in rows], "ownLink": False, "ownerName": owner_name}
 
 
 @app.get("/api/waypoints/{wp_id}/shares")
@@ -1518,10 +1583,16 @@ async def list_waypoint_shares(wp_id: str, request: Request):
         raise HTTPException(404, "Waypoint not found")
     if wp_res.data[0]["visitor_id"] != vid:
         raise HTTPException(403, "This pin belongs to a different visitor")
-    res = await supabase.table("waypoint_share_grants").select("id,created_at").eq(
+    res = await supabase.table("waypoint_share_grants").select("id,created_at,recipient_vid").eq(
         "waypoint_id", wp_id
     ).is_("revoked_at", "null").order("created_at", desc=False).execute()
-    return {"grants": [{"id": g["id"], "createdAt": g["created_at"]} for g in res.data]}
+    names = await _lookup_display_names([g["recipient_vid"] for g in res.data])
+    return {
+        "grants": [
+            {"id": g["id"], "createdAt": g["created_at"], "name": names.get(g["recipient_vid"])}
+            for g in res.data
+        ]
+    }
 
 
 @app.post("/api/waypoints/{wp_id}/shares/{grant_id}/revoke")
