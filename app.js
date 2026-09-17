@@ -1339,6 +1339,38 @@
     await promptAcceptSharedWaypoints(code);
   }
 
+  // Optional, per-visitor display name shown only in pin-sharing contexts (never required
+  // elsewhere in the app). Cached in memory once fetched/saved so repeated share/accept
+  // modals don't refetch it every time within the same session.
+  let __cachedDisplayName = null;
+  let __displayNameFetched = false;
+  async function fetchDisplayName() {
+    if (__displayNameFetched) return __cachedDisplayName;
+    try {
+      const data = await apiFetch('/api/profile/name');
+      __cachedDisplayName = data.name || null;
+    } catch (e) {
+      // best-effort -- sharing still works with no saved name
+    }
+    __displayNameFetched = true;
+    return __cachedDisplayName;
+  }
+  async function saveDisplayName(name) {
+    const trimmed = (name || '').trim();
+    if (!trimmed || trimmed === __cachedDisplayName) return;
+    try {
+      const data = await apiFetch('/api/profile/name', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: trimmed }),
+      });
+      __cachedDisplayName = data.name;
+      __displayNameFetched = true;
+    } catch (e) {
+      // best-effort -- sharing/accepting still works without a saved name
+    }
+  }
+
   // Previews a share code (no grant created) and, unless it's the visitor's own link,
   // shows the Accept/Decline modal before anything is recorded server-side.
   async function promptAcceptSharedWaypoints(code) {
@@ -1365,7 +1397,13 @@
     }
     const modal = document.getElementById('acceptShareModal');
     const desc = document.getElementById('acceptShareDesc');
-    desc.textContent = `A hunter shared ${preview.count} pin${preview.count === 1 ? '' : 's'} with you`;
+    const ownerLabel = preview.ownerName || 'A hunter';
+    desc.textContent = `${ownerLabel} shared ${preview.count} pin${preview.count === 1 ? '' : 's'} with you`;
+    const nameInput = document.getElementById('acceptNameInput');
+    if (nameInput) {
+      nameInput.value = __cachedDisplayName || '';
+      fetchDisplayName().then((n) => { if (n && !nameInput.value) nameInput.value = n; });
+    }
     modal.classList.add('open');
     const acceptBtn = document.getElementById('acceptShareBtn');
     const declineBtn = document.getElementById('declineShareBtn');
@@ -1378,6 +1416,8 @@
     const onAccept = async () => {
       acceptBtn.disabled = true;
       acceptBtn.textContent = 'Adding\u2026';
+      const nameEl = document.getElementById('acceptNameInput');
+      if (nameEl && nameEl.value.trim()) await saveDisplayName(nameEl.value);
       await acceptSharedWaypointCode(code);
       acceptBtn.disabled = false;
       acceptBtn.textContent = 'Accept';
@@ -1398,9 +1438,15 @@
     const modal = document.getElementById('shareModal');
     const input = document.getElementById('shareLinkInput');
     const countEl = document.getElementById('shareModalCount');
+    const nameInput = document.getElementById('shareNameInput');
     if (!modal || !input) return;
     input.value = link;
     if (countEl) countEl.textContent = count === 1 ? 'Sharing 1 pin' : `Sharing ${count} pins`;
+    if (nameInput) {
+      nameInput.value = __cachedDisplayName || '';
+      nameInput.onblur = () => saveDisplayName(nameInput.value);
+      fetchDisplayName().then((n) => { if (n && !nameInput.value) nameInput.value = n; });
+    }
     modal.classList.add('open');
     // "Manage access" only makes sense for a single-pin share, where we can unambiguously
     // ask the backend who currently holds a live grant on that one waypoint.
@@ -1427,9 +1473,10 @@
       list.innerHTML = '';
       grants.forEach((g) => {
         const when = new Date(g.createdAt * 1000).toLocaleDateString();
+        const nameHtml = g.name ? `<span class="share-access-name">${escapeHtml(g.name)}</span>` : '';
         const li = document.createElement('li');
         li.className = 'share-access-row';
-        li.innerHTML = `<span class="share-access-when">Accepted ${when}</span><button type="button" class="share-access-revoke" data-revoke-grant="${g.id}">Revoke</button>`;
+        li.innerHTML = `<span>${nameHtml}<span class="share-access-when">Accepted ${when}</span></span><button type="button" class="share-access-revoke" data-revoke-grant="${g.id}">Revoke</button>`;
         li.querySelector('[data-revoke-grant]').addEventListener('click', async () => {
           try {
             await apiFetch(`/api/waypoints/${encodeURIComponent(wpId)}/shares/${g.id}/revoke`, { method: 'POST' });
@@ -5728,14 +5775,25 @@
 
   /* ---------------- Share-pin modal ---------------- */
   const shareModal = document.getElementById('shareModal');
-  document.getElementById('shareClose').addEventListener('click', () => shareModal.classList.remove('open'));
+  function flushShareNameSave() {
+    const nameEl = document.getElementById('shareNameInput');
+    if (nameEl && nameEl.value.trim()) saveDisplayName(nameEl.value);
+  }
+  document.getElementById('shareClose').addEventListener('click', () => {
+    flushShareNameSave();
+    shareModal.classList.remove('open');
+  });
   shareModal.addEventListener('click', (e) => {
-    if (e.target === shareModal) shareModal.classList.remove('open');
+    if (e.target === shareModal) {
+      flushShareNameSave();
+      shareModal.classList.remove('open');
+    }
   });
   document.getElementById('shareCopyBtn').addEventListener('click', () => {
     const input = document.getElementById('shareLinkInput');
     input.select();
     copyShareLink(input.value);
+    flushShareNameSave();
   });
   // Native share sheet (Messages/Mail/AirDrop/etc.) for pin links — mirrors onX's
   // "Share with a Link" step, which hands the link straight to the OS share sheet
@@ -5754,6 +5812,7 @@
       const countMatch = countEl && /(\d+)/.exec(countEl.textContent || '');
       const n = countMatch ? parseInt(countMatch[1], 10) : 1;
       const shareText = n > 1 ? `Check out these ${n} pins I found in EScout:` : 'Check out this pin I found in EScout:';
+      flushShareNameSave();
       try {
         await navigator.share({
           title: 'EScout pin',
