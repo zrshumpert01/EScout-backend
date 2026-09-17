@@ -1193,7 +1193,7 @@
     return addUserWaypoint(
       wp.type,
       { lng: wp.lng, lat: wp.lat },
-      { label: wp.label, note: wp.note, confidence: wp.confidence, viewOnly: !!wp.viewOnly },
+      { label: wp.label, note: wp.note, confidence: wp.confidence, viewOnly: !!wp.viewOnly, ownerName: wp.ownerName },
       { id: wp.id, skipSave: true }
     );
   }
@@ -5270,7 +5270,9 @@
     const def = wpDef(record.type);
     const confHtml = record.confidence != null ? `<div class="popup-desc"><strong>${escapeHtml(record.confidence)}%</strong> Scout AI match confidence</div>` : '';
     const noteHtml = record.note ? `<div class="popup-desc">${escapeHtml(record.note)}</div>` : '';
-    const sharedTagHtml = record.viewOnly ? '<div class="popup-desc"><span class="tag shared-tag">Shared with you — view only</span></div>' : '';
+    const sharedTagHtml = record.viewOnly
+      ? `<div class="popup-desc popup-shared-by">Shared with you by <strong>${escapeHtml(record.ownerName || 'a hunter')}</strong></div>`
+      : '';
     const coordText = `${fmtCoord(record.lngLat.lat)}, ${fmtCoord(record.lngLat.lng)}`;
     const coordsHtml =
       '<div class="popup-coords">' +
@@ -5336,6 +5338,7 @@
       note: meta && meta.note,
       confidence: meta && meta.confidence,
       viewOnly,
+      ownerName: meta && meta.ownerName,
     };
     el.addEventListener('click', (ev) => {
       ev.stopPropagation();
