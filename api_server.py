@@ -841,6 +841,30 @@ class RestoreConfirmBody(BaseModel):
 RESTORE_CODE_TTL_SECONDS = 10 * 60  # 10 minutes
 RESTORE_MAX_CODE_ATTEMPTS = 5
 
+# App Review demo account. Sign-in is passwordless, so an Apple reviewer has no inbox to read
+# the emailed code from and literally cannot enter the app -- Guideline 2.1 requires we give
+# them full access. This one address instead accepts a fixed code supplied through the Render
+# environment, so the secret never enters git or dist/public. Both values unset (local dev,
+# any future environment) means the path is completely inert: _is_review_account returns False
+# and sign-in behaves exactly as it does for everyone else.
+APP_REVIEW_EMAIL = (os.getenv("APP_REVIEW_EMAIL") or "").strip().lower()
+APP_REVIEW_CODE = (os.getenv("APP_REVIEW_CODE") or "").strip()
+
+
+def _is_review_account(email: str) -> bool:
+    if not APP_REVIEW_EMAIL:
+        return False
+    return secrets.compare_digest(email, APP_REVIEW_EMAIL)
+
+
+def _review_code_matches(code: str) -> bool:
+    # Minimum length guards against a truncated or accidentally-blanked env var turning into a
+    # trivially guessable bypass. compare_digest keeps the check free of a timing oracle.
+    if len(APP_REVIEW_CODE) < 6:
+        return False
+    return secrets.compare_digest(code, APP_REVIEW_CODE)
+
+
 # Sender for verification-code emails, and the API key for the send itself. Same dual-path
 # pattern as Stripe above: production (Render) sets RESEND_API_KEY directly as a real secret
 # in the dashboard, so it survives redeploys and never touches git or dist/public. Sandbox/dev
@@ -1216,6 +1240,12 @@ async def auth_request_code(body: AuthRequestBody, request: Request):
         raise HTTPException(400, "Enter a valid email address")
     await rate_limit(f"auth_req_email:{email}", limit=3, window_seconds=600)
 
+    if _is_review_account(email):
+        # App Review can't read our inbox, so this address uses the fixed code from the
+        # environment. Nothing is stored and no mail is sent, but the response is identical
+        # to a real send so the sign-in screen behaves normally for the reviewer.
+        return {"sent": True}
+
     code = f"{secrets.randbelow(1_000_000):06d}"
     now = int(time.time())
     await supabase.table("restore_codes").insert({
@@ -1243,37 +1273,43 @@ async def auth_verify_code(body: AuthVerifyBody, request: Request):
         raise HTTPException(400, "Enter the code from your email")
 
     now = int(time.time())
-    res = (
-        await supabase.table("restore_codes")
-        .select("id,code_hash,vid,attempts,expires_at,used_at")
-        .eq("email", email)
-        .eq("vid", vid)
-        .eq("purpose", "login")
-        .order("created_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-    rows = res.data
-    row = rows[0] if rows else None
-    invalid = HTTPException(400, "That code is invalid or has expired — request a new one")
-    if not row or row.get("used_at") or row["expires_at"] < now:
-        raise invalid
-    if row["attempts"] >= RESTORE_MAX_CODE_ATTEMPTS:
-        raise HTTPException(429, "Too many incorrect attempts — request a new code")
-    if not secrets.compare_digest(row["code_hash"], _hash_restore_code(email, code)):
+
+    # The App Review address proves itself with the fixed environment code instead of a mailed
+    # one, so it has no restore_codes row to look up. Every other caller goes through the
+    # normal path below completely unchanged.
+    reviewer = _is_review_account(email) and _review_code_matches(code)
+    if not reviewer:
+        res = (
+            await supabase.table("restore_codes")
+            .select("id,code_hash,vid,attempts,expires_at,used_at")
+            .eq("email", email)
+            .eq("vid", vid)
+            .eq("purpose", "login")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data
+        row = rows[0] if rows else None
+        invalid = HTTPException(400, "That code is invalid or has expired — request a new one")
+        if not row or row.get("used_at") or row["expires_at"] < now:
+            raise invalid
+        if row["attempts"] >= RESTORE_MAX_CODE_ATTEMPTS:
+            raise HTTPException(429, "Too many incorrect attempts — request a new code")
+        if not secrets.compare_digest(row["code_hash"], _hash_restore_code(email, code)):
+            await (
+                supabase.table("restore_codes")
+                .update({"attempts": row["attempts"] + 1})
+                .eq("id", row["id"])
+                .execute()
+            )
+            raise invalid
         await (
             supabase.table("restore_codes")
-            .update({"attempts": row["attempts"] + 1})
+            .update({"used_at": now})
             .eq("id", row["id"])
             .execute()
         )
-        raise invalid
-    await (
-        supabase.table("restore_codes")
-        .update({"used_at": now})
-        .eq("id", row["id"])
-        .execute()
-    )
 
     acct_res = await supabase.table("accounts").select("email,visitor_id").eq("email", email).limit(1).execute()
     if acct_res.data:
