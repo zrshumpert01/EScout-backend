@@ -1303,6 +1303,200 @@ async def auth_verify_code(body: AuthVerifyBody, request: Request):
 
 
 # ------------------------------------------------------------------------------------------
+# Account deletion. App Store Review Guideline 5.1.1(v) requires that any app supporting
+# account creation also let the user delete that account from inside the app, so this is a
+# hard requirement for shipping on iOS, not a nicety.
+#
+# Two steps on purpose. Sign-in state here is a durable visitor id (cookie/query param), not
+# a short-lived session, so possession of an unlocked phone is otherwise enough to irreversibly
+# destroy someone's account. Requiring a fresh emailed code proves the caller still controls
+# the inbox before anything is erased.
+# ------------------------------------------------------------------------------------------
+
+
+class AccountDeleteBody(BaseModel):
+    code: str
+
+
+async def _account_email_for_vid(vid: str) -> str:
+    res = await supabase.table("accounts").select("email").eq("visitor_id", vid).limit(1).execute()
+    if not res.data:
+        raise HTTPException(401, "You need to be signed in to delete your account")
+    return res.data[0]["email"]
+
+
+async def _send_delete_code_email(email: str, code: str) -> None:
+    if not RESEND_BASE:
+        raise HTTPException(500, "Email service isn't configured on the server yet")
+    resp = await http_client.post(
+        f"{RESEND_BASE}/emails",
+        headers=RESEND_KEY_HEADER,
+        json={
+            "from": RESTORE_FROM_EMAIL,
+            "to": [email],
+            "subject": f"{code} is your EScout account deletion code",
+            "text": (
+                f"Your EScout account deletion code is {code}.\n\n"
+                "Entering this code in the app will permanently delete your EScout account, "
+                "including every saved pin, trail camera entry, and hunt journal entry. This "
+                "cannot be undone. The code expires in 10 minutes.\n\n"
+                "If you did NOT request this, do not enter the code \u2014 ignore this email and "
+                "your account stays exactly as it is."
+            ),
+            "html": (
+                "<p>Your EScout account deletion code is:</p>"
+                f"<p style='font-size:28px;font-weight:700;letter-spacing:4px'>{code}</p>"
+                "<p>Entering this code in the app will <strong>permanently delete your EScout "
+                "account</strong>, including every saved pin, trail camera entry, and hunt "
+                "journal entry. This cannot be undone. The code expires in 10 minutes.</p>"
+                "<p>If you did <strong>not</strong> request this, do not enter the code \u2014 ignore "
+                "this email and your account stays exactly as it is.</p>"
+            ),
+        },
+    )
+    if resp.status_code >= 400:
+        raise HTTPException(502, "Couldn't send the confirmation email \u2014 please try again shortly")
+
+
+@app.post("/api/account/delete/request-code")
+async def account_delete_request_code(request: Request):
+    await rate_limit(f"acct_del_req_ip:{client_ip(request)}", limit=5, window_seconds=60)
+    vid = request.state.vid
+    email = await _account_email_for_vid(vid)
+    await rate_limit(f"acct_del_req_email:{email}", limit=3, window_seconds=600)
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    now = int(time.time())
+    await supabase.table("restore_codes").insert({
+        "email": email,
+        "code_hash": _hash_restore_code(email, code),
+        "vid": vid,
+        "attempts": 0,
+        "expires_at": now + RESTORE_CODE_TTL_SECONDS,
+        "created_at": now,
+        "purpose": "delete",
+    }).execute()
+    await _send_delete_code_email(email, code)
+    # Echo the address (which the client already knows) so the UI can say exactly where it went.
+    return {"sent": True, "email": email}
+
+
+# POST rather than DELETE: this carries a body, and intermediate proxies are entitled to drop
+# the body off a DELETE. Mirrors the /api/restore/confirm naming already used above.
+@app.post("/api/account/delete/confirm")
+async def delete_account(body: AccountDeleteBody, request: Request):
+    await rate_limit(f"acct_del:{client_ip(request)}", limit=10, window_seconds=60)
+    vid = request.state.vid
+    email = await _account_email_for_vid(vid)
+    code = (body.code or "").strip()
+    if not code:
+        raise HTTPException(400, "Enter the code from your email")
+
+    now = int(time.time())
+    res = (
+        await supabase.table("restore_codes")
+        .select("id,code_hash,vid,attempts,expires_at,used_at")
+        .eq("email", email)
+        .eq("vid", vid)
+        .eq("purpose", "delete")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    row = res.data[0] if res.data else None
+    invalid = HTTPException(400, "That code is invalid or has expired \u2014 request a new one")
+    if not row or row.get("used_at") or row["expires_at"] < now:
+        raise invalid
+    if row["attempts"] >= RESTORE_MAX_CODE_ATTEMPTS:
+        raise HTTPException(429, "Too many incorrect attempts \u2014 request a new code")
+    if not secrets.compare_digest(row["code_hash"], _hash_restore_code(email, code)):
+        await (
+            supabase.table("restore_codes")
+            .update({"attempts": row["attempts"] + 1})
+            .eq("id", row["id"])
+            .execute()
+        )
+        raise invalid
+    # Burn the code before doing any destructive work, so a retried/duplicated request can't
+    # re-enter the deletion path partway through.
+    await supabase.table("restore_codes").update({"used_at": now}).eq("id", row["id"]).execute()
+
+    sub_res = (
+        await supabase.table("subscriptions")
+        .select("stripe_subscription_id,comp_code,source")
+        .eq("visitor_id", vid)
+        .limit(1)
+        .execute()
+    )
+    sub = sub_res.data[0] if sub_res.data else None
+
+    # Billing first. If this fails we abort before deleting anything, because the one outcome
+    # we must never produce is a live recurring charge with no account left to cancel it from.
+    cancelled_subscription = False
+    if sub and sub.get("stripe_subscription_id"):
+        try:
+            await stripe_request("DELETE", f"/v1/subscriptions/{sub['stripe_subscription_id']}")
+            cancelled_subscription = True
+        except HTTPException as exc:
+            # A subscription Stripe no longer has (already cancelled, or test data) must not
+            # block the user from deleting their account.
+            if exc.status_code not in (404, 400):
+                raise HTTPException(
+                    502,
+                    "We couldn't cancel your subscription with our payment processor, so nothing "
+                    "was deleted. Please try again in a moment.",
+                )
+
+    # Release any complimentary code back to unredeemed so it can be issued or reused later.
+    released_comp_code = False
+    if sub and sub.get("comp_code"):
+        await (
+            supabase.table("comp_grants")
+            .update({"redeemed_at": None, "redeemed_visitor_id": None})
+            .eq("code", sub["comp_code"])
+            .execute()
+        )
+        released_comp_code = True
+    # Belt and braces: catch any grant claimed by this visitor that the subscription row
+    # didn't name (e.g. an older grant superseded by a later one).
+    await (
+        supabase.table("comp_grants")
+        .update({"redeemed_at": None, "redeemed_visitor_id": None})
+        .eq("redeemed_visitor_id", vid)
+        .execute()
+    )
+
+    # Shares in both directions. Grants where this account owns the pin would also disappear
+    # via the waypoint_id FK cascade when the pins go, but grants where this account is the
+    # RECIPIENT point at other people's pins and would otherwise survive as dangling access.
+    await supabase.table("waypoint_share_grants").delete().eq("recipient_vid", vid).execute()
+    await supabase.table("waypoint_share_grants").delete().eq("owner_vid", vid).execute()
+    # Share-link rows are keyed on the owner, so any outstanding link they handed out dies here.
+    await supabase.table("waypoint_shares").delete().eq("visitor_id", vid).execute()
+
+    await supabase.table("waypoints").delete().eq("visitor_id", vid).execute()
+    await supabase.table("view_state").delete().eq("visitor_id", vid).execute()
+    await supabase.table("display_names").delete().eq("visitor_id", vid).execute()
+    await supabase.table("subscriptions").delete().eq("visitor_id", vid).execute()
+    # Every outstanding sign-in/restore/delete code for this address, so no emailed code can
+    # be replayed against a recreated account.
+    await supabase.table("restore_codes").delete().eq("email", email).execute()
+    # The account row goes last: while it exists the steps above remain re-runnable if this
+    # request dies midway, whereas losing it first would orphan everything else.
+    await supabase.table("accounts").delete().eq("email", email).execute()
+
+    response = JSONResponse({
+        "deleted": True,
+        "cancelledSubscription": cancelled_subscription,
+        "releasedCompCode": released_comp_code,
+    })
+    # Clear the device's identity so the app comes back up as a brand new free visitor rather
+    # than a signed-in one pointing at rows that no longer exist.
+    response.delete_cookie(VISITOR_COOKIE, path="/")
+    return response
+
+
+# ------------------------------------------------------------------------------------------
 # Waypoints (dropped pins) — persisted per visitor, plus shareable links so a set of pins can
 # be shared onto another visitor's map. Sharing is a
 # LIVE, view-only grant (see waypoint_share_grants below), not a copy: the recipient always
