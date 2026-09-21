@@ -218,7 +218,48 @@ async def lifespan(app):
 
 
 app = FastAPI(lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# CORS is load-bearing here, not decorative: the frontend is served from escouthunt.com /
+# escout.pplx.app but calls this backend at escout-backend.onrender.com, so every single API
+# call is cross-origin. An origin missing from this list doesn't degrade — it breaks the app
+# for everyone on that origin. So add, don't prune, unless you're certain an origin is dead.
+#
+# Replaces a former allow_origins=["*"], which let any website on the internet call these
+# endpoints — most importantly the auth/restore ones that send mail through Resend from our
+# own domain.
+#
+# `capacitor://localhost` is the iOS native WebView's origin and `https://localhost` is
+# Android's. Both are Capacitor defaults (server.iosScheme=capacitor, server.androidScheme=
+# https, server.hostname=localhost) and capacitor.config.json overrides none of them, so the
+# native app's fetches carry those Origin headers. Documented at
+# https://capacitorjs.com/docs/config. Android is listed ahead of ever shipping there.
+#
+# allow_credentials stays OFF (the default). Identity rides in the `vid` query parameter, not
+# a cookie, so nothing here needs credentialed requests — and leaving it off means a hostile
+# page still cannot make a victim's browser attach anything it has stored for us.
+#
+# Requests with no Origin header at all (curl, server-to-server, Stripe webhooks) are not
+# affected by any of this: CORS is enforced by browsers, not by this middleware.
+ALLOWED_ORIGINS = [
+    "https://escouthunt.com",
+    "https://www.escouthunt.com",
+    "https://escout.pplx.app",
+    "capacitor://localhost",
+    "https://localhost",
+]
+
+# Preview/staging deploys land on generated *.pplx.app hostnames (sites.pplx.app proxy,
+# preview--*.pplx.app), which can't be enumerated ahead of time. Anchored at both ends so it
+# matches the whole origin and can't be satisfied by a lookalike such as
+# https://evil-pplx.app.example.com.
+ALLOWED_ORIGIN_REGEX = r"https://[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.pplx\.app"
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # Per-visitor identity — deliberately NOT a custom request header or a Set-Cookie response
