@@ -2023,7 +2023,7 @@ PADUS_PRIMARY_DYNAMIC_LAYERS = json.dumps([{
             "symbol": {
                 "type": "esriSFS",
                 "style": "esriSFSSolid",
-                "color": [57, 255, 20, 64],
+                "color": [57, 255, 20, 31],
                 "outline": {"type": "esriSLS", "style": "esriSLSSolid", "color": [57, 255, 20, 210], "width": 0.75},
             },
         },
@@ -2080,7 +2080,7 @@ USACE_CWLDM_DYNAMIC_LAYERS = json.dumps([{
             "symbol": {
                 "type": "esriSFS",
                 "style": "esriSFSSolid",
-                "color": [57, 255, 20, 109],
+                "color": [57, 255, 20, 53],
                 "outline": {"type": "esriSLS", "style": "esriSLSSolid", "color": [57, 255, 20, 210], "width": 0.75},
             },
         },
@@ -2113,10 +2113,11 @@ NETL_FALLBACK_WHERE = (
 # Fill opacity raised 2026-09-26 at the user's request ("the fill is too transparent, I'm unable
 # to clearly determine public from private"): ~4% -> ~25% (alpha 64) for PAD-US, and the USACE
 # layer below matched to the same ~25% on screen (requested 109 -> renders ~64 after the
-# ~0.588x attenuation noted above). User explicitly asked for the Corps fill too, superseding the
+# ~0.588x attenuation noted above). Dialed back same day to ~12% (alpha 31; USACE requested 53 -> renders
+# 31, verified live) after the user found 25% too strong. User explicitly asked for the Corps fill too, superseding the
 # 2026-09-15 "keep it faint" stopgap; the in-app flowage-easement disclaimer stays. Outlines are
 # deliberately UNCHANGED (user: "the outline is fine").
-PADUS_FILL_RGBA = (57, 255, 20, 64)
+PADUS_FILL_RGBA = (57, 255, 20, 31)
 PADUS_OUTLINE_RGBA = (57, 255, 20, 210)
 TILE_SIZE = 256
 _TRANSPARENT_TILE = None  # lazily built once, see _blank_tile()
