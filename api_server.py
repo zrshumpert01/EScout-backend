@@ -2023,8 +2023,8 @@ PADUS_PRIMARY_DYNAMIC_LAYERS = json.dumps([{
             "symbol": {
                 "type": "esriSFS",
                 "style": "esriSFSSolid",
-                "color": [57, 255, 20, 31],
-                "outline": {"type": "esriSLS", "style": "esriSLSSolid", "color": [57, 255, 20, 210], "width": 0.75},
+                "color": [88, 180, 72, 26],
+                "outline": {"type": "esriSLS", "style": "esriSLSSolid", "color": [88, 180, 72, 235], "width": 1.5},
             },
         },
     },
@@ -2080,8 +2080,8 @@ USACE_CWLDM_DYNAMIC_LAYERS = json.dumps([{
             "symbol": {
                 "type": "esriSFS",
                 "style": "esriSFSSolid",
-                "color": [57, 255, 20, 53],
-                "outline": {"type": "esriSLS", "style": "esriSLSSolid", "color": [57, 255, 20, 210], "width": 0.75},
+                "color": [88, 180, 72, 44],
+                "outline": {"type": "esriSLS", "style": "esriSLSSolid", "color": [88, 180, 72, 235], "width": 1.5},
             },
         },
     },
@@ -2117,8 +2117,12 @@ NETL_FALLBACK_WHERE = (
 # 31, verified live) after the user found 25% too strong. User explicitly asked for the Corps fill too, superseding the
 # 2026-09-15 "keep it faint" stopgap; the in-app flowage-easement disclaimer stays. Outlines are
 # deliberately UNCHANGED (user: "the outline is fine").
-PADUS_FILL_RGBA = (57, 255, 20, 31)
-PADUS_OUTLINE_RGBA = (57, 255, 20, 210)
+# 2026-09-26: restyled to an onX-like natural green (user picked option "A"): ~10% fill
+# (alpha 26) with a clearer 1.5px edge, replacing the neon (57,255,20) at ~12% that made
+# forested public land look hazy. USACE requests fill 44 (renders ~26 after the ~0.588x
+# attenuation noted above).
+PADUS_FILL_RGBA = (88, 180, 72, 26)
+PADUS_OUTLINE_RGBA = (88, 180, 72, 235)
 TILE_SIZE = 256
 _TRANSPARENT_TILE = None  # lazily built once, see _blank_tile()
 
@@ -2207,7 +2211,7 @@ def _rasterize_netl_features(features: list[dict], bbox: tuple[float, float, flo
     fill_layer = Image.new("RGBA", (dim, dim), (0, 0, 0, 0))
     outline_layer = Image.new("RGBA", (dim, dim), (0, 0, 0, 0))
     outline_draw = ImageDraw.Draw(outline_layer)
-    outline_width = max(1, round(0.75 * scale))
+    outline_width = max(1, round(1.5 * scale))
 
     for feat in features:
         rings = (feat.get("geometry") or {}).get("rings") or []
