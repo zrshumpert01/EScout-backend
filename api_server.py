@@ -2023,7 +2023,7 @@ PADUS_PRIMARY_DYNAMIC_LAYERS = json.dumps([{
             "symbol": {
                 "type": "esriSFS",
                 "style": "esriSFSSolid",
-                "color": [190, 240, 165, 48],
+                "color": [190, 240, 165, 33],
                 "outline": {"type": "esriSLS", "style": "esriSLSSolid", "color": [140, 215, 115, 255], "width": 1.5},
             },
         },
@@ -2080,7 +2080,7 @@ USACE_CWLDM_DYNAMIC_LAYERS = json.dumps([{
             "symbol": {
                 "type": "esriSFS",
                 "style": "esriSFSSolid",
-                "color": [190, 240, 165, 82],
+                "color": [190, 240, 165, 57],
                 "outline": {"type": "esriSLS", "style": "esriSLSSolid", "color": [140, 215, 115, 255], "width": 1.5},
             },
         },
@@ -2124,7 +2124,7 @@ NETL_FALLBACK_WHERE = (
 # 2026-09-26 (later): user picked light-green "Option A" -- a lighter onX-style green at ~30%
 # on screen (alpha 83 x 0.92 raster-opacity) so public vs private is easy to tell. USACE requests
 # fill 141 (renders ~83 after the ~0.588x attenuation). Outline a slightly deeper light green.
-PADUS_FILL_RGBA = (190, 240, 165, 48)
+PADUS_FILL_RGBA = (190, 240, 165, 33)
 PADUS_OUTLINE_RGBA = (140, 215, 115, 255)
 TILE_SIZE = 256
 _TRANSPARENT_TILE = None  # lazily built once, see _blank_tile()
