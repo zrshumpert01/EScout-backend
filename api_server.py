@@ -1709,6 +1709,30 @@ async def create_waypoints_bulk(body: WaypointBulkBody, request: Request):
     return {"waypoints": created}
 
 
+class WaypointUpdateBody(BaseModel):
+    # Only the pin's style (type) and its display label can be edited; position, note and
+    # ownership are untouched. Same length caps as WaypointBody.
+    type: str = Field(min_length=1, max_length=40)
+    label: str | None = Field(default=None, max_length=200)
+
+
+@app.patch("/api/waypoints/{wp_id}")
+async def update_waypoint(wp_id: str, body: WaypointUpdateBody, request: Request):
+    await rate_limit(f"waypoint-write:{client_ip(request)}", limit=60, window_seconds=60)
+    vid = request.state.vid
+    res = await supabase.table("waypoints").select("visitor_id").eq("id", wp_id).limit(1).execute()
+    if not res.data:
+        raise HTTPException(404, "Waypoint not found")
+    # Owner-only, same check as delete: people a pin is shared with can never edit it.
+    if res.data[0]["visitor_id"] != vid:
+        raise HTTPException(403, "This pin belongs to a different visitor")
+    update = {"type": body.type}
+    if body.label is not None:
+        update["label"] = body.label
+    await supabase.table("waypoints").update(update).eq("id", wp_id).execute()
+    return {"id": wp_id, **update}
+
+
 @app.delete("/api/waypoints/{wp_id}")
 async def delete_waypoint(wp_id: str, request: Request):
     vid = request.state.vid
