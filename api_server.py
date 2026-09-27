@@ -2023,8 +2023,8 @@ PADUS_PRIMARY_DYNAMIC_LAYERS = json.dumps([{
             "symbol": {
                 "type": "esriSFS",
                 "style": "esriSFSSolid",
-                "color": [88, 180, 72, 26],
-                "outline": {"type": "esriSLS", "style": "esriSLSSolid", "color": [88, 180, 72, 235], "width": 1.5},
+                "color": [150, 220, 120, 83],
+                "outline": {"type": "esriSLS", "style": "esriSLSSolid", "color": [120, 205, 95, 255], "width": 1.5},
             },
         },
     },
@@ -2080,8 +2080,8 @@ USACE_CWLDM_DYNAMIC_LAYERS = json.dumps([{
             "symbol": {
                 "type": "esriSFS",
                 "style": "esriSFSSolid",
-                "color": [88, 180, 72, 44],
-                "outline": {"type": "esriSLS", "style": "esriSLSSolid", "color": [88, 180, 72, 235], "width": 1.5},
+                "color": [150, 220, 120, 141],
+                "outline": {"type": "esriSLS", "style": "esriSLSSolid", "color": [120, 205, 95, 255], "width": 1.5},
             },
         },
     },
@@ -2121,8 +2121,11 @@ NETL_FALLBACK_WHERE = (
 # (alpha 26) with a clearer 1.5px edge, replacing the neon (57,255,20) at ~12% that made
 # forested public land look hazy. USACE requests fill 44 (renders ~26 after the ~0.588x
 # attenuation noted above).
-PADUS_FILL_RGBA = (88, 180, 72, 26)
-PADUS_OUTLINE_RGBA = (88, 180, 72, 235)
+# 2026-09-26 (later): user picked light-green "Option A" -- a lighter onX-style green at ~30%
+# on screen (alpha 83 x 0.92 raster-opacity) so public vs private is easy to tell. USACE requests
+# fill 141 (renders ~83 after the ~0.588x attenuation). Outline a slightly deeper light green.
+PADUS_FILL_RGBA = (150, 220, 120, 83)
+PADUS_OUTLINE_RGBA = (120, 205, 95, 255)
 TILE_SIZE = 256
 _TRANSPARENT_TILE = None  # lazily built once, see _blank_tile()
 
