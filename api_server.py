@@ -31,6 +31,7 @@ import io
 import json
 import math
 import os
+import re
 import secrets
 import time
 import uuid
@@ -40,7 +41,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from PIL import Image, ImageChops, ImageDraw
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
 from pydantic import BaseModel, Field
 from supabase import AsyncClient, create_async_client
 
@@ -2761,6 +2762,396 @@ async def private_roads(bbox: str):
         _private_roads_cache.pop(oldest_key, None)
     _private_roads_cache[cell_key] = (now + PRIVATE_ROADS_CACHE_TTL, geojson)
     return JSONResponse(geojson)
+
+
+
+# ---------------------------------------------------------------------------------------
+# Crop Fields layer (Premium) -- USDA NASS Cropland Data Layer (CDL).
+#
+# Colors only agricultural fields, shaded by what was actually planted that year (corn, soy,
+# cotton, wheat, ...), the way onX's crop layer reads. Everything that isn't a crop (forest,
+# water, towns, pasture/grassland, wetlands) is left fully transparent so the imagery shows
+# through untouched.
+#
+# Data path: CropScape's WCS returns the RAW class codes (one byte per pixel) as an
+# uncompressed GeoTIFF, and it accepts an EPSG:3857 bbox directly even though it doesn't
+# advertise it -- verified that the returned GeoTIFF origin and pixel size match the requested
+# web-mercator tile exactly, so no reprojection is needed on our side. Working from codes
+# (rather than the WMS's pre-colored PNG) lets us use our own palette and outline field edges.
+#
+# Premium is enforced HERE, not just by hiding the toggle client-side: tile and point requests
+# must carry a `vid` whose subscription is active. The subscription check is cached per visitor
+# for a few minutes because get_subscription() re-verifies against Stripe on every call, and a
+# single pan can request a dozen tiles at once.
+#
+# Rendered tiles are cached twice: an in-process dict for hot tiles, and permanently in the
+# existing contour_tile_cache table (namespaced key, so no new table/grant is needed). A CDL
+# year never changes after release, so a rendered tile is valid indefinitely; bump
+# CROP_TILE_STYLE_VERSION if the palette changes.
+# ---------------------------------------------------------------------------------------
+CDL_WCS_URL = "https://nassgeodata.gmu.edu/CropScapeService/wms_cdlall.cgi"
+CDL_YEARS = (2025, 2024, 2023)  # 2025 is the latest national CDL (released 2026-02-27)
+CROP_TILE_STYLE_VERSION = "v1"
+CROP_MIN_Z = 10
+CROP_MAX_Z = 16
+CROP_FILL_ALPHA = 165
+CROP_EDGE_ALPHA = 235
+
+# group id -> (RGB, CDL codes). Double-crop classes are colored by their summer crop, since that's
+# what's standing in the field during most of hunting season.
+CROP_GROUPS: dict[str, tuple[tuple[int, int, int], tuple[int, ...]]] = {
+    "corn": ((242, 193, 46), (1, 12, 13, 225, 226, 228, 237, 241)),
+    "soybeans": ((88, 178, 72), (5, 26, 240, 254)),
+    "cotton": ((222, 96, 160), (2, 232, 238, 239)),
+    "rice": ((52, 170, 196), (3,)),
+    "sorghum": ((230, 126, 46), (4, 234, 235, 236)),
+    "wheat": ((196, 150, 92), (22, 23, 24)),
+    "small_grains": ((226, 204, 150), (21, 25, 27, 28, 29, 30, 39, 205)),
+    "peanuts": ((166, 110, 70), (10,)),
+    "hay": ((170, 214, 110), (36, 37, 58, 59, 60, 224)),
+    "fallow": ((176, 166, 146), (61,)),
+    "orchards": ((120, 86, 180), tuple(range(66, 78)) + (204, 210, 211, 212, 215, 217, 218, 220, 223, 242, 250)),
+}
+# Every other agricultural CDL class (vegetables, oilseeds, sugar crops, tobacco, herbs, ...)
+# falls into one "other crops" shade. 62-65 and 81-195 are non-agricultural (pasture/grassland,
+# forest, shrub, barren, water, developed, wetlands) and stay transparent.
+CROP_OTHER_RGB = (205, 92, 92)
+_CROP_AG_CODES = set(range(1, 62)) | set(range(66, 78)) | set(range(204, 255))
+
+
+def _build_crop_lut() -> list[tuple[int, int, int, int]]:
+    lut = [(0, 0, 0, 0)] * 256
+    for code in _CROP_AG_CODES:
+        lut[code] = (*CROP_OTHER_RGB, CROP_FILL_ALPHA)
+    for rgb, codes in CROP_GROUPS.values():
+        for code in codes:
+            lut[code] = (*rgb, CROP_FILL_ALPHA)
+    return lut
+
+
+_CROP_LUT = _build_crop_lut()
+_crop_tile_cache: dict[str, tuple[float, bytes, str]] = {}
+_crop_render_sem = asyncio.Semaphore(3)  # same ceiling as the other upstream renders on 512 MB
+_premium_cache: dict[str, tuple[float, bool]] = {}
+_crop_point_cache: dict[str, tuple[float, dict]] = {}
+
+
+async def _is_premium_cached(request: Request) -> bool:
+    vid = request.state.vid
+    hit = _premium_cache.get(vid)
+    now = time.time()
+    if hit and hit[0] > now:
+        return hit[1]
+    try:
+        sub = await get_subscription(request)
+        ok = sub.get("tier", "free") != "free"
+    except Exception:
+        return False  # don't cache a failed lookup either way
+    if len(_premium_cache) > 5000:
+        _premium_cache.clear()
+    _premium_cache[vid] = (now + (300 if ok else 30), ok)
+    return ok
+
+
+def _tile_bbox_3857(z: int, x: int, y: int) -> tuple[float, float, float, float]:
+    half = 20037508.342789244  # exact web-mercator half-width (not the padded validation bound)
+    size = 2 * half / (2 ** z)
+    xmin = -half + x * size
+    ymax = half - y * size
+    return xmin, ymax - size, xmin + size, ymax
+
+
+def _crop_fetch_size(z: int) -> int:
+    """WCS request size for a tile. Zoomed out (z<=13) one output pixel already covers >=19 m, so
+    fetch at full 256 px. Zoomed in, fetch at ~15 m/pixel (half a 30 m CDL cell) instead: the
+    majority filter below can then actually remove isolated single-cell misclassifications
+    (a lone cell is only 2x2 px at that scale), and the upstream request is smaller/faster."""
+    span_m = 2 * 20037508.342789244 / (2 ** z)
+    return max(32, min(TILE_SIZE, round(span_m / 15.0)))
+
+
+def _render_crop_tile(tiff_bytes: bytes, z: int) -> bytes | None:
+    """Turn a CDL class-code GeoTIFF into a transparent RGBA PNG with crop-only fills and a
+    darker 1px outline wherever one field's crop meets another's (or meets non-crop land).
+    Returns None when the tile contains no crop pixels at all."""
+    import numpy as np
+
+    img = Image.open(io.BytesIO(tiff_bytes))
+    if img.mode != "L":
+        img = img.convert("L")
+    # 3x3 majority filter at fetch resolution: keeps field shapes, drops salt-and-pepper
+    # single-cell noise that otherwise shows up as stray colored specks in woods and towns.
+    img = img.filter(ImageFilter.ModeFilter(3))
+    if img.size != (TILE_SIZE, TILE_SIZE):
+        img = img.resize((TILE_SIZE, TILE_SIZE), Image.NEAREST)
+    codes = np.asarray(img, dtype=np.uint8)
+    lut = np.array(_CROP_LUT, dtype=np.uint8)
+    rgba = lut[codes].copy()
+    is_crop = rgba[:, :, 3] > 0
+    if not is_crop.any():
+        return None
+    # Field edges: a crop pixel whose right/left/up/down neighbour has a different code.
+    edge = np.zeros_like(is_crop)
+    edge[:, :-1] |= codes[:, :-1] != codes[:, 1:]
+    edge[:, 1:] |= codes[:, 1:] != codes[:, :-1]
+    edge[:-1, :] |= codes[:-1, :] != codes[1:, :]
+    edge[1:, :] |= codes[1:, :] != codes[:-1, :]
+    edge &= is_crop
+    if z >= 12:
+        rgba[edge, :3] = (rgba[edge, :3].astype(np.uint16) * 62 // 100).astype(np.uint8)
+        rgba[edge, 3] = CROP_EDGE_ALPHA
+    out = Image.fromarray(rgba, "RGBA")
+    buf = io.BytesIO()
+    out.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+@app.get("/api/tiles/crops")
+async def crop_tile(request: Request, z: int, x: int, y: int, year: int = CDL_YEARS[0]):
+    """Premium-only crop-type tile (XYZ, 256px, EPSG:3857) from the USDA Cropland Data Layer."""
+    if year not in CDL_YEARS:
+        raise HTTPException(400, "invalid year")
+    if not (CROP_MIN_Z <= z <= CROP_MAX_Z) or not (0 <= x < 2 ** z) or not (0 <= y < 2 ** z):
+        raise HTTPException(400, "invalid tile")
+    if not await _is_premium_cached(request):
+        raise HTTPException(402, "Crop fields are a Premium feature")
+
+    key = f"crops|{CROP_TILE_STYLE_VERSION}|{year}|{z}|{x}|{y}"
+    headers = {"Cache-Control": "private, max-age=604800"}
+    hot = _tile_cache_get(_crop_tile_cache, key)
+    if hot is not None:
+        data, source = hot
+        return Response(content=data, media_type="image/png", headers={**headers, "X-Tile-Source": f"{source}-mem"})
+    db_key = hashlib.sha256(key.encode()).hexdigest()
+    cached = await _contour_cache_get(db_key)
+    if cached is not None:
+        _tile_cache_set(_crop_tile_cache, key, cached, "crops-db")
+        return Response(content=cached, media_type="image/png", headers={**headers, "X-Tile-Source": "crops-db"})
+
+    await rate_limit(f"crops_miss:{client_ip(request)}", limit=120, window_seconds=60)
+    xmin, ymin, xmax, ymax = _tile_bbox_3857(z, x, y)
+    params = {
+        "service": "WCS",
+        "version": "1.0.0",
+        "request": "GetCoverage",
+        "coverage": f"cdl_{year}",
+        "crs": "EPSG:3857",
+        "bbox": f"{xmin:.3f},{ymin:.3f},{xmax:.3f},{ymax:.3f}",
+        "width": _crop_fetch_size(z),
+        "height": _crop_fetch_size(z),
+        "format": "GTiff",
+    }
+    last_error = "unknown"
+    async with _crop_render_sem:
+        for attempt in range(2):
+            try:
+                resp = await http_client.get(CDL_WCS_URL, params=params, timeout=httpx.Timeout(25.0))
+                ctype = resp.headers.get("content-type", "")
+                if resp.status_code == 200 and ctype.startswith("image/tiff"):
+                    png = await asyncio.to_thread(_render_crop_tile, resp.content, z)
+                    data = png if png is not None else _blank_tile()
+                    source = "crops-direct" if png is not None else "crops-empty"
+                    _tile_cache_set(_crop_tile_cache, key, data, source)
+                    await _contour_cache_set(db_key, data)
+                    return Response(content=data, media_type="image/png", headers={**headers, "X-Tile-Source": source})
+                last_error = f"status {resp.status_code} {ctype}"
+            except (httpx.TimeoutException, httpx.HTTPError) as e:
+                last_error = type(e).__name__
+            except Exception as e:  # corrupt TIFF etc. -- degrade, never 500 a map tile
+                last_error = type(e).__name__
+            if attempt == 0:
+                await asyncio.sleep(0.5)
+    # Upstream failed: blank, uncached, so it retries after CropScape recovers.
+    return Response(content=_blank_tile(), media_type="image/png", headers={"X-Tile-Source": "none-error", "X-Tile-Error": last_error})
+
+
+# Display names for the tap readout (from the 2025 CDL metadata's attribute domain; double-crop
+# classes shortened to "Winter Wheat / Soybeans" style).
+CDL_NAMES: dict[int, str] = {
+    1: "Corn",
+    2: "Cotton",
+    3: "Rice",
+    4: "Sorghum",
+    5: "Soybeans",
+    6: "Sunflower",
+    10: "Peanuts",
+    11: "Tobacco",
+    12: "Sweet Corn",
+    13: "Popcorn",
+    14: "Mint",
+    21: "Barley",
+    22: "Durum Wheat",
+    23: "Spring Wheat",
+    24: "Winter Wheat",
+    25: "Other Small Grains",
+    26: "Winter Wheat / Soybeans",
+    27: "Rye",
+    28: "Oats",
+    29: "Millet",
+    30: "Speltz",
+    31: "Canola",
+    32: "Flaxseed",
+    33: "Safflower",
+    34: "Rapeseed",
+    35: "Mustard",
+    36: "Alfalfa",
+    37: "Hay",
+    38: "Camelina",
+    39: "Buckwheat",
+    41: "Sugarbeets",
+    42: "Dry Beans",
+    43: "Potatoes",
+    44: "Other Crops",
+    45: "Sugarcane",
+    46: "Sweet Potatoes",
+    47: "Vegetables & Fruit",
+    48: "Watermelons",
+    49: "Onions",
+    50: "Cucumbers",
+    51: "Chickpeas",
+    52: "Lentils",
+    53: "Peas",
+    54: "Tomatoes",
+    55: "Caneberries",
+    56: "Hops",
+    57: "Herbs",
+    58: "Clover / Wildflowers",
+    59: "Sod / Grass Seed",
+    60: "Switchgrass",
+    61: "Fallow / Idle",
+    62: "Pasture / Grass",
+    63: "Forest",
+    64: "Shrubland",
+    65: "Barren",
+    66: "Cherries",
+    67: "Peaches",
+    68: "Apples",
+    69: "Grapes",
+    70: "Christmas Trees",
+    71: "Other Tree Crops",
+    72: "Citrus",
+    74: "Pecans",
+    75: "Almonds",
+    76: "Walnuts",
+    77: "Pears",
+    92: "Aquaculture",
+    111: "Open Water",
+    121: "Developed",
+    122: "Developed",
+    123: "Developed",
+    124: "Developed",
+    131: "Barren",
+    141: "Hardwood Forest",
+    142: "Evergreen Forest",
+    143: "Mixed Forest",
+    152: "Shrubland",
+    176: "Grassland / Pasture",
+    190: "Woody Wetlands",
+    195: "Herbaceous Wetlands",
+    204: "Pistachios",
+    205: "Triticale",
+    206: "Carrots",
+    207: "Asparagus",
+    208: "Garlic",
+    209: "Cantaloupes",
+    210: "Prunes",
+    211: "Olives",
+    212: "Oranges",
+    213: "Honeydew",
+    214: "Broccoli",
+    215: "Avocados",
+    216: "Peppers",
+    217: "Pomegranates",
+    218: "Nectarines",
+    219: "Greens",
+    220: "Plums",
+    221: "Strawberries",
+    222: "Squash",
+    223: "Apricots",
+    224: "Vetch",
+    225: "Winter Wheat / Corn",
+    226: "Oats / Corn",
+    227: "Lettuce",
+    228: "Triticale / Corn",
+    229: "Pumpkins",
+    230: "Lettuce / Durum Wheat",
+    231: "Lettuce / Cantaloupe",
+    232: "Lettuce / Cotton",
+    233: "Lettuce / Barley",
+    234: "Durum Wheat / Sorghum",
+    235: "Barley / Sorghum",
+    236: "Winter Wheat / Sorghum",
+    237: "Barley / Corn",
+    238: "Winter Wheat / Cotton",
+    239: "Soybeans / Cotton",
+    240: "Soybeans / Oats",
+    241: "Corn / Soybeans",
+    242: "Blueberries",
+    243: "Cabbage",
+    244: "Cauliflower",
+    245: "Celery",
+    246: "Radishes",
+    247: "Turnips",
+    248: "Eggplants",
+    249: "Gourds",
+    250: "Cranberries",
+    254: "Barley / Soybeans"
+}
+
+
+async def _cdl_point(year: int, lng: float, lat: float) -> dict | None:
+    """Majority class in a ~3x3-cell (~90 m) window around the point, so a tap on a field edge
+    or a single misclassified 30 m cell reports what the field actually is -- matching what the
+    majority-filtered tile shows -- instead of a one-pixel artifact."""
+    d = 0.00045
+    params = {
+        "service": "WCS",
+        "version": "1.0.0",
+        "request": "GetCoverage",
+        "coverage": f"cdl_{year}",
+        "crs": "EPSG:4326",
+        "bbox": f"{lng - d:.6f},{lat - d:.6f},{lng + d:.6f},{lat + d:.6f}",
+        "width": 3,
+        "height": 3,
+        "format": "GTiff",
+    }
+    try:
+        resp = await http_client.get(CDL_WCS_URL, params=params, timeout=httpx.Timeout(12.0))
+        if resp.status_code != 200 or not resp.headers.get("content-type", "").startswith("image/tiff"):
+            return None
+        img = Image.open(io.BytesIO(resp.content)).convert("L")
+        vals = list(img.tobytes())
+        center = vals[len(vals) // 2]
+        counts = collections.Counter(vals)
+        best = max(counts.values())
+        code = center if counts[center] == best else counts.most_common(1)[0][0]
+        if code == 0:
+            return None
+        return {"year": year, "code": code, "crop": CDL_NAMES.get(code, "Other"), "isCrop": code in _CROP_AG_CODES}
+    except Exception:
+        return None
+
+
+@app.get("/api/crops/point")
+async def crop_point(request: Request, lng: float, lat: float):
+    """Premium-only crop readout for a tapped point: what was planted there in each CDL year."""
+    if not (-125.0 <= lng <= -66.0 and 24.0 <= lat <= 50.0):
+        return {"history": [], "covered": False}  # CDL covers the lower 48 only
+    if not await _is_premium_cached(request):
+        raise HTTPException(402, "Crop fields are a Premium feature")
+    await rate_limit(f"crops_point:{client_ip(request)}", limit=40, window_seconds=60)
+    key = f"{lng:.4f},{lat:.4f}"
+    hit = _crop_point_cache.get(key)
+    if hit and hit[0] > time.time():
+        return hit[1]
+    results = await asyncio.gather(*[_cdl_point(yr, lng, lat) for yr in CDL_YEARS])
+    history = [r for r in results if r]
+    out = {"history": history, "covered": True}
+    if history:
+        if len(_crop_point_cache) > 2000:
+            _crop_point_cache.clear()
+        _crop_point_cache[key] = (time.time() + 24 * 3600, out)
+    return out
 
 
 if __name__ == "__main__":
