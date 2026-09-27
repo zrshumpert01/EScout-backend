@@ -1199,6 +1199,7 @@ async def _merge_visitor_into_account(old_vid: str, canonical_vid: str) -> None:
     if old_vid == canonical_vid:
         return
     await supabase.table("waypoints").update({"visitor_id": canonical_vid}).eq("visitor_id", old_vid).execute()
+    await supabase.table("tracks").update({"visitor_id": canonical_vid}).eq("visitor_id", old_vid).execute()
     await supabase.table("waypoint_shares").update({"visitor_id": canonical_vid}).eq("visitor_id", old_vid).execute()
     await supabase.table("waypoint_share_grants").update({"recipient_vid": canonical_vid}).eq(
         "recipient_vid", old_vid
@@ -1552,6 +1553,7 @@ async def delete_account(body: AccountDeleteBody, request: Request):
     await supabase.table("waypoint_shares").delete().eq("visitor_id", vid).execute()
 
     await supabase.table("waypoints").delete().eq("visitor_id", vid).execute()
+    await supabase.table("tracks").delete().eq("visitor_id", vid).execute()
     await supabase.table("view_state").delete().eq("visitor_id", vid).execute()
     await supabase.table("display_names").delete().eq("visitor_id", vid).execute()
     await supabase.table("subscriptions").delete().eq("visitor_id", vid).execute()
@@ -1763,6 +1765,125 @@ async def _lookup_display_names(vids: list[str]) -> dict[str, str]:
         return {}
     res = await supabase.table("display_names").select("visitor_id,name").in_("visitor_id", unique).execute()
     return {row["visitor_id"]: row["name"] for row in res.data}
+
+
+# ------------------------------------------------------------------------------------------
+# Tracks (recorded GPS walks, onX-style) — Premium only. Saved per visitor like waypoints, so
+# a signed-in account sees them on every device (merged in _merge_visitor_into_account and
+# wiped in account deletion). Points are stored as a compact [[lng, lat, unix_seconds], ...]
+# array; distance is recomputed server-side from the points rather than trusted from the client.
+# ------------------------------------------------------------------------------------------
+
+TRACK_MAX_POINTS = 20000  # ~11 h at one point every 2 s — far beyond a normal hunt
+TRACK_COLUMNS = "id,name,points,distance_m,duration_s,created_at"
+
+
+class TrackBody(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    points: list[list[float]] = Field(min_length=2, max_length=TRACK_MAX_POINTS)
+
+
+class TrackRenameBody(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+
+
+def _track_distance_m(points: list[list[float]]) -> float:
+    total = 0.0
+    for a, b in zip(points, points[1:]):
+        lat1, lat2 = math.radians(a[1]), math.radians(b[1])
+        dlat = lat2 - lat1
+        dlng = math.radians(b[0] - a[0])
+        h = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlng / 2) ** 2
+        total += 2 * 6371008.8 * math.asin(min(1.0, math.sqrt(h)))
+    return total
+
+
+async def _require_premium(request: Request) -> None:
+    sub = await get_subscription(request)
+    if sub.get("tier", "free") == "free":
+        raise HTTPException(402, "Tracks are a Premium feature")
+
+
+@app.get("/api/tracks")
+async def list_tracks(request: Request):
+    vid = request.state.vid
+    res = await supabase.table("tracks").select(TRACK_COLUMNS).eq("visitor_id", vid).order(
+        "created_at", desc=True
+    ).execute()
+    return {
+        "tracks": [
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "points": r["points"],
+                "distanceM": r["distance_m"],
+                "durationS": r["duration_s"],
+                "createdAt": r["created_at"],
+            }
+            for r in res.data
+        ]
+    }
+
+
+@app.post("/api/tracks")
+async def create_track(body: TrackBody, request: Request):
+    await rate_limit(f"track-write:{client_ip(request)}", limit=20, window_seconds=60)
+    await _require_premium(request)
+    vid = request.state.vid
+    pts = []
+    for p in body.points:
+        if len(p) < 3:
+            raise HTTPException(400, "Each track point needs lng, lat and time")
+        lng, lat, t = p[0], p[1], p[2]
+        if not (-180 <= lng <= 180 and -90 <= lat <= 90 and math.isfinite(t)):
+            raise HTTPException(400, "Track point out of range")
+        pts.append([round(lng, 6), round(lat, 6), int(t)])
+    distance = round(_track_distance_m(pts), 1)
+    duration = max(0, pts[-1][2] - pts[0][2])
+    track_id = secrets.token_urlsafe(9)
+    now = int(time.time())
+    await supabase.table("tracks").insert(
+        {
+            "id": track_id,
+            "visitor_id": vid,
+            "name": body.name.strip() or "Track",
+            "points": pts,
+            "distance_m": distance,
+            "duration_s": duration,
+            "created_at": now,
+        }
+    ).execute()
+    return {
+        "id": track_id,
+        "name": body.name.strip() or "Track",
+        "points": pts,
+        "distanceM": distance,
+        "durationS": duration,
+        "createdAt": now,
+    }
+
+
+async def _own_track_or_404(track_id: str, vid: str) -> None:
+    res = await supabase.table("tracks").select("visitor_id").eq("id", track_id).limit(1).execute()
+    if not res.data or res.data[0]["visitor_id"] != vid:
+        raise HTTPException(404, "Track not found")
+
+
+@app.patch("/api/tracks/{track_id}")
+async def rename_track(track_id: str, body: TrackRenameBody, request: Request):
+    await rate_limit(f"track-write:{client_ip(request)}", limit=20, window_seconds=60)
+    vid = request.state.vid
+    await _own_track_or_404(track_id, vid)
+    await supabase.table("tracks").update({"name": body.name.strip()}).eq("id", track_id).execute()
+    return {"id": track_id, "name": body.name.strip()}
+
+
+@app.delete("/api/tracks/{track_id}")
+async def delete_track(track_id: str, request: Request):
+    vid = request.state.vid
+    await _own_track_or_404(track_id, vid)
+    await supabase.table("tracks").delete().eq("id", track_id).eq("visitor_id", vid).execute()
+    return {"deleted": True}
 
 
 @app.post("/api/waypoints/share")
