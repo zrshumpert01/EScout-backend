@@ -2961,7 +2961,10 @@ async def contour_tile(request: Request, z: int, bbox: str, rule: str):
     # in this file (20/min, matching the checkout/portal tier) because each miss can trigger a
     # multi-second external render plus a database write, unlike the cheap-read routes that use
     # the higher 60/min tier.
-    await rate_limit(f"contour_miss:{client_ip(request)}", limit=20, window_seconds=60)
+    # Raised from 20/min: zooming a phone through 3-4 levels over a never-cached area needs ~40-60
+    # fresh renders in well under a minute, so 20/min was 429-ing real users and leaving holes in
+    # the contour layer. 150/min still stops a runaway script from hammering USGS.
+    await rate_limit(f"contour_miss:{client_ip(request)}", limit=150, window_seconds=60)
 
     canon_bbox_str = ",".join(f"{v:.2f}" for v in canon_bbox)
     params = {
