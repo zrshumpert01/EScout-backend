@@ -2703,7 +2703,7 @@ def _parse_bbox(bbox: str) -> tuple[float, float, float, float]:
     return xmin, ymin, xmax, ymax
 
 
-def _rasterize_netl_features(features: list[dict], bbox: tuple[float, float, float, float]) -> bytes:
+def _rasterize_netl_features(features: list[dict], bbox: tuple[float, float, float, float], out_size: int = TILE_SIZE) -> bytes:
     """Render Esri-JSON polygon features (already in the tile's EPSG:3857 bbox/size) into a
     transparent 256x256 PNG matching the primary source's fill+outline style. Supersamples at
     4x and downsamples with antialiasing, since Pillow's native polygon drawing has no
@@ -2713,6 +2713,8 @@ def _rasterize_netl_features(features: list[dict], bbox: tuple[float, float, flo
     order, which Esri JSON doesn't reliably encode.
     """
     xmin, ymin, xmax, ymax = bbox
+    # Always draw on the same 1024px canvas; a 512px (sharp-screen) tile just downsamples less.
+    # Outline width is set in canvas pixels, so it keeps the same on-screen weight either way.
     scale = 4
     dim = TILE_SIZE * scale
     span_x = xmax - xmin
@@ -2746,14 +2748,23 @@ def _rasterize_netl_features(features: list[dict], bbox: tuple[float, float, flo
         fill_layer = Image.composite(fill_solid, fill_layer, feature_mask)
 
     composited = Image.alpha_composite(fill_layer, outline_layer)
-    composited = composited.resize((TILE_SIZE, TILE_SIZE), Image.LANCZOS)
+    composited = composited.resize((out_size, out_size), Image.LANCZOS)
     buf = io.BytesIO()
     composited.save(buf, format="PNG")
     return buf.getvalue()
 
 
+def _tile_px(px: int | None) -> int:
+    """Output tile size: 256 (default) or 512 for sharp (retina) phone screens."""
+    if px is None or px == 256:
+        return 256
+    if px == 512:
+        return 512
+    raise HTTPException(status_code=400, detail="invalid px")
+
+
 @app.get("/api/tiles/public-land")
-async def public_land_tile(bbox: str):
+async def public_land_tile(bbox: str, px: int | None = None):
     """Serves the PAD-US public-land highlight tile by querying the primary source's feature
     layer directly (geometry + attributes for the tile's bbox, filtered server-side by
     PADUS_PRIMARY_WHERE) and rasterizing the result ourselves -- NOT via the MapServer's
@@ -2768,8 +2779,10 @@ async def public_land_tile(bbox: str):
         parsed_bbox = _parse_bbox(bbox)
     except ValueError:
         raise HTTPException(status_code=400, detail="invalid bbox")
+    out_px = _tile_px(px)
+    cache_key = bbox if out_px == 256 else f"{bbox}|512"
 
-    cached = _tile_cache_get(_public_land_tile_cache, bbox)
+    cached = _tile_cache_get(_public_land_tile_cache, cache_key)
     if cached is not None:
         data, source = cached
         return Response(content=data, media_type="image/png", headers={"X-Tile-Source": f"{source}-cached"})
@@ -2799,9 +2812,9 @@ async def public_land_tile(bbox: str):
             if "error" not in data:
                 features = data.get("features") or []
                 if not features:
-                    return _cache_and_respond(_public_land_tile_cache, bbox, _blank_tile(), "padus-primary-empty")
-                tile_bytes = _rasterize_netl_features(features, parsed_bbox)
-                return _cache_and_respond(_public_land_tile_cache, bbox, tile_bytes, "padus-primary")
+                    return _cache_and_respond(_public_land_tile_cache, cache_key, _blank_tile(), "padus-primary-empty")
+                tile_bytes = _rasterize_netl_features(features, parsed_bbox, out_px)
+                return _cache_and_respond(_public_land_tile_cache, cache_key, tile_bytes, "padus-primary")
         except (httpx.TimeoutException, httpx.HTTPError, ValueError):
             pass  # retry once, then fall through to NETL fallback below
         if attempt == 0:
@@ -2825,9 +2838,9 @@ async def public_land_tile(bbox: str):
         data = resp.json()
         features = data.get("features") or []
         if not features:
-            return _cache_and_respond(_public_land_tile_cache, bbox, _blank_tile(), "none-empty")
-        tile_bytes = _rasterize_netl_features(features, parsed_bbox)
-        return _cache_and_respond(_public_land_tile_cache, bbox, tile_bytes, "netl-fallback")
+            return _cache_and_respond(_public_land_tile_cache, cache_key, _blank_tile(), "none-empty")
+        tile_bytes = _rasterize_netl_features(features, parsed_bbox, out_px)
+        return _cache_and_respond(_public_land_tile_cache, cache_key, tile_bytes, "netl-fallback")
     except Exception:
         # Both sources failed -- degrade to a blank tile rather than a broken image or a
         # 500 that would surface as a map error to the user. Deliberately NOT cached: a
@@ -2836,7 +2849,7 @@ async def public_land_tile(bbox: str):
 
 
 @app.get("/api/tiles/usace-land")
-async def usace_land_tile(bbox: str):
+async def usace_land_tile(bbox: str, px: int | None = None):
     """Proxies the USACE REMIS (Civil Works Land Data Migration) layer-5 tile. This is a
     straight passthrough, not a fallback like public_land_tile above -- there's only one
     upstream source here, and it isn't down, it's a browser CORS restriction: USACE only
@@ -2851,8 +2864,10 @@ async def usace_land_tile(bbox: str):
         _parse_bbox(bbox)
     except ValueError:
         raise HTTPException(status_code=400, detail="invalid bbox")
+    out_px = _tile_px(px)
+    cache_key = bbox if out_px == 256 else f"{bbox}|512"
 
-    cached = _tile_cache_get(_usace_tile_cache, bbox)
+    cached = _tile_cache_get(_usace_tile_cache, cache_key)
     if cached is not None:
         data, source = cached
         return Response(content=data, media_type="image/png", headers={"X-Tile-Source": f"{source}-cached"})
@@ -2861,7 +2876,9 @@ async def usace_land_tile(bbox: str):
         "bbox": bbox,
         "bboxSR": 3857,
         "imageSR": 3857,
-        "size": f"{TILE_SIZE},{TILE_SIZE}",
+        "size": f"{out_px},{out_px}",
+        # Keep line weights the same on screen at 512px (ArcGIS draws symbols per-DPI).
+        "dpi": 96 * out_px // 256,
         "format": "png32",
         "transparent": "true",
         "layers": "show:5",
@@ -2872,7 +2889,7 @@ async def usace_land_tile(bbox: str):
         resp = await http_client.get(USACE_CWLDM_TILE_SERVICE, params=params, timeout=httpx.Timeout(8.0))
         content_type = resp.headers.get("content-type", "")
         if resp.status_code == 200 and content_type.startswith("image/"):
-            _tile_cache_set(_usace_tile_cache, bbox, resp.content, "usace-direct")
+            _tile_cache_set(_usace_tile_cache, cache_key, resp.content, "usace-direct")
             return Response(content=resp.content, media_type=content_type, headers={"X-Tile-Source": "usace-direct"})
     except (httpx.TimeoutException, httpx.HTTPError):
         pass
@@ -2963,7 +2980,7 @@ async def _contour_cache_set(cache_key: str, data: bytes) -> None:
 
 
 @app.get("/api/tiles/contour")
-async def contour_tile(request: Request, z: int, bbox: str, rule: str):
+async def contour_tile(request: Request, z: int, bbox: str, rule: str, px: int | None = None):
     """Proxies + permanently caches a USGS 3DEP contour-line tile render. `rule` is the
     frontend's already-computed zoom-tier choice ('fine' below CONTOUR_ZOOM_DETAIL_THRESHOLD,
     'coarse' above it) -- validated against an allow-list here rather than trusted as a raw
@@ -2981,7 +2998,9 @@ async def contour_tile(request: Request, z: int, bbox: str, rule: str):
     except ValueError:
         raise HTTPException(status_code=400, detail="invalid bbox")
 
-    cache_key = _contour_cache_key(z, canon_bbox, rule)
+    out_px = _tile_px(px)
+    # 256px tiles keep their original cache keys; 512px (sharp-screen) renders get their own.
+    cache_key = _contour_cache_key(z, canon_bbox, rule if out_px == 256 else f"{rule}|512")
     cached = await _contour_cache_get(cache_key)
     if cached is not None:
         return Response(
@@ -3005,7 +3024,7 @@ async def contour_tile(request: Request, z: int, bbox: str, rule: str):
         "bbox": canon_bbox_str,
         "bboxSR": 3857,
         "imageSR": 3857,
-        "size": f"{TILE_SIZE},{TILE_SIZE}",
+        "size": f"{out_px},{out_px}",
         "format": "png32",
         "transparent": "true",
         "renderingRule": CONTOUR_RENDERING_RULES[rule],
