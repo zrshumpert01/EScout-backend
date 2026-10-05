@@ -1098,6 +1098,34 @@ async def restore_confirm(body: RestoreConfirmBody, request: Request):
         .execute()
     )
 
+    # Proving the inbox is exactly what sign-in proves, so restoring also signs this device in
+    # to that email's account (creating it if needed) and continues on the account's identity.
+    # Without this, a restore copied Premium onto a device that stayed signed out: the app
+    # then asked for the email a second time and the account's pins didn't show.
+    acct_res = await supabase.table("accounts").select("email,visitor_id").eq("email", email).limit(1).execute()
+    if acct_res.data:
+        canonical_vid = acct_res.data[0]["visitor_id"]
+    else:
+        canonical_vid = vid
+        await supabase.table("accounts").insert(
+            {"email": email, "visitor_id": canonical_vid, "created_at": now}
+        ).execute()
+    if vid != canonical_vid:
+        await _merge_visitor_into_account(vid, canonical_vid)
+    vid = canonical_vid
+
+    def _signed_in_response(payload: dict) -> JSONResponse:
+        response = JSONResponse({**payload, "signedIn": True, "visitorId": canonical_vid, "email": email})
+        response.set_cookie(
+            VISITOR_COOKIE,
+            canonical_vid,
+            max_age=VISITOR_COOKIE_MAX_AGE,
+            path="/",
+            samesite="lax",
+            httponly=True,
+        )
+        return response
+
     found = await _find_active_subscription_by_email(email)
     if found:
         best_customer_id, best_sub = found
@@ -1112,7 +1140,7 @@ async def restore_confirm(body: RestoreConfirmBody, request: Request):
             source="stripe",
             comp_code=None,
         )
-        return {"restored": True, "tier": "premium", "status": best_sub.get("status")}
+        return _signed_in_response({"restored": True, "tier": "premium", "status": best_sub.get("status")})
 
     # No paid subscription — check for a complimentary (comp) grant on file for this email
     # before giving up. This is what lets a comp'd member (a friend/family free-access grant,
@@ -1122,7 +1150,13 @@ async def restore_confirm(body: RestoreConfirmBody, request: Request):
     if not comp:
         # Safe to be specific now — the caller already proved they own this inbox, so this
         # can't be used to probe which emails have paid or been granted access.
-        raise HTTPException(404, "No active subscription or complimentary access found for that email")
+        # The account itself may already carry Premium (e.g. it was on another device and the
+        # merge above just brought this device onto it) — report that rather than an error.
+        acct_sub = await get_row(canonical_vid)
+        if acct_sub and (acct_sub.get("tier") or "free") != "free":
+            return _signed_in_response({"restored": True, "tier": acct_sub["tier"], "status": acct_sub.get("status")})
+        return _signed_in_response({"restored": False, "tier": "free", "status": None,
+                                    "message": "Signed in, but no active subscription or complimentary access was found for that email"})
 
     # Re-point the grant at this device/visitor id, same as how a fresh redemption works — the
     # original expiry is preserved, this doesn't grant any extra time.
@@ -1141,7 +1175,7 @@ async def restore_confirm(body: RestoreConfirmBody, request: Request):
         source="comp",
         comp_code=comp["code"],
     )
-    return {"restored": True, "tier": comp["tier"], "status": "comp_active"}
+    return _signed_in_response({"restored": True, "tier": comp["tier"], "status": "comp_active"})
 
 
 # ------------------------------------------------------------------------------------------
