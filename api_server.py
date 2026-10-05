@@ -214,7 +214,9 @@ async def lifespan(app):
         raise RuntimeError("SUPABASE_URL and SUPABASE_ANON_KEY must be set")
     supabase = await create_async_client(SUPABASE_URL, SUPABASE_ANON_KEY)
     http_client = httpx.AsyncClient(timeout=20)
+    warm_task = asyncio.create_task(_nhd_warm_mississippi())
     yield
+    warm_task.cancel()
     await http_client.aclose()
 
 
@@ -3052,6 +3054,223 @@ async def contour_tile(request: Request, z: int, bbox: str, rule: str, px: int |
     return Response(
         content=_blank_tile(), media_type="image/png", headers={"X-Tile-Source": "none-error", "X-Tile-Error": last_error or "unknown"}
     )
+
+
+# ---------------------------------------------------------------------------------------
+# Water (USGS NHD creeks, ponds, lakes) as vector data, cached for everyone (2026-10-05).
+# USGS's NHD query service is slow and flaky (5-40 s per request, sometimes timing out), so
+# the frontend asks HERE for one big z12 square (~10 km) at a time. The first request for a
+# square fetches it from USGS; the result is stored permanently in the existing
+# contour_tile_cache table (namespaced key, gzip JSON -- no new table/grant needed), so every
+# later request from anyone is a fast database read. NHD changes rarely; bump
+# NHD_CELL_VERSION to refresh.
+# ---------------------------------------------------------------------------------------
+NHD_SERVICE = "https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer"
+NHD_CELL_Z = 12
+NHD_CELL_VERSION = "v1"
+_nhd_hot: "collections.OrderedDict[str, bytes]" = collections.OrderedDict()
+NHD_HOT_MAX = 120  # ~100-300 KB each, keeps Render memory bounded
+_nhd_locks: dict[str, asyncio.Lock] = {}
+
+
+def _nhd_hot_put(key: str, data: bytes) -> None:
+    _nhd_hot[key] = data
+    _nhd_hot.move_to_end(key)
+    while len(_nhd_hot) > NHD_HOT_MAX:
+        _nhd_hot.popitem(last=False)
+
+
+def _nhd_key(x: int, y: int) -> str:
+    return hashlib.sha256(f"nhd|{NHD_CELL_VERSION}|{NHD_CELL_Z}|{x}|{y}".encode()).hexdigest()
+
+
+async def _nhd_cache_get(cache_key: str) -> bytes | None:
+    try:
+        res = await supabase.table("contour_tile_cache").select("png_data").eq("cache_key", cache_key).limit(1).execute()
+        if not res.data:
+            return None
+        hex_str = res.data[0]["png_data"]
+        if not isinstance(hex_str, str):
+            return None
+        if hex_str.startswith("\\x"):
+            hex_str = hex_str[2:]
+        data = bytes.fromhex(hex_str)
+        return data if data[:2] == b"\x1f\x8b" else None  # gzip only
+    except Exception:
+        return None
+
+
+async def _nhd_query(client_layer: int, bbox: str, fields: str) -> list:
+    params = {
+        "geometry": bbox, "geometryType": "esriGeometryEnvelope", "inSR": 3857, "outSR": 4326,
+        "spatialRel": "esriSpatialRelIntersects", "outFields": fields, "returnGeometry": "true",
+        "maxAllowableOffset": "0.00002", "geometryPrecision": 5, "f": "geojson",
+    }
+    last = None
+    for attempt in range(3):
+        try:
+            resp = await http_client.get(f"{NHD_SERVICE}/{client_layer}/query", params=params, timeout=httpx.Timeout(60.0))
+            if resp.status_code == 200:
+                j = resp.json()
+                if isinstance(j, dict) and isinstance(j.get("features"), list):
+                    return j["features"]
+            last = f"status {resp.status_code}"
+        except (httpx.TimeoutException, httpx.HTTPError, ValueError) as e:
+            last = str(e)
+        await asyncio.sleep(0.8 * (attempt + 1))
+    raise RuntimeError(last or "nhd query failed")
+
+
+def _nhd_prop(p: dict, k: str):
+    v = p.get(k)
+    return v if v is not None else p.get(k.upper())
+
+
+async def _nhd_build_cell(x: int, y: int) -> bytes:
+    import gzip
+    R = 20037508.342789244
+    t = 2 * R / (2 ** NHD_CELL_Z)
+    bbox = f"{-R + x * t:.2f},{R - (y + 1) * t:.2f},{-R + (x + 1) * t:.2f},{R - y * t:.2f}"
+    lines, bodies, areas = await asyncio.gather(
+        _nhd_query(6, bbox, "gnis_name,fcode"),
+        _nhd_query(12, bbox, "gnis_name,fcode"),
+        _nhd_query(9, bbox, "gnis_name,fcode"),
+        return_exceptions=True,
+    )
+    if isinstance(lines, Exception):
+        raise lines  # streams are the important part -- don't cache a square without them
+    out = []
+    for f in lines:
+        props = f.get("properties") or {}
+        try:
+            fc = int(_nhd_prop(props, "fcode") or 0)
+        except (TypeError, ValueError):
+            fc = 0
+        # streams/rivers (460xx) and canals/ditches (336xx); artificial paths through lakes
+        # and connectors are skipped so lines aren't drawn across ponds
+        if not f.get("geometry") or not (46000 <= fc < 46100 or 33600 <= fc < 33700):
+            continue
+        out.append({"type": "Feature", "geometry": f["geometry"],
+                    "properties": {"k": "l", "fc": fc, "n": _nhd_prop(props, "gnis_name") or ""}})
+    for group in (bodies, areas):
+        if isinstance(group, Exception):
+            continue
+        for f in group:
+            if not f.get("geometry"):
+                continue
+            props = f.get("properties") or {}
+            try:
+                fc = int(_nhd_prop(props, "fcode") or 0)
+            except (TypeError, ValueError):
+                fc = 0
+            out.append({"type": "Feature", "geometry": f["geometry"],
+                        "properties": {"k": "a", "fc": fc, "n": _nhd_prop(props, "gnis_name") or ""}})
+    return gzip.compress(json.dumps(out, separators=(",", ":")).encode(), compresslevel=6)
+
+
+# Background pre-load of every Mississippi water square (nearest Tupelo first), so users there
+# never wait on USGS. Runs after each deploy but skips squares already in the cache, so once
+# finished it's just a quick pass of cheap key lookups. Gentle on USGS: 2 at a time.
+NHD_WARM_BBOX = (-91.66, 30.17, -88.09, 35.01)  # Mississippi
+NHD_WARM_CENTER = (-88.70, 34.26)  # Tupelo
+
+
+async def _nhd_cell_cached(key: str) -> bool:
+    try:
+        res = await supabase.table("contour_tile_cache").select("cache_key").eq("cache_key", key).limit(1).execute()
+        return bool(res.data)
+    except Exception:
+        return True  # can't tell -> don't hammer USGS
+
+
+async def _nhd_warm_mississippi() -> None:
+    try:
+        await asyncio.sleep(30)  # let the service finish starting up first
+        n = 2 ** NHD_CELL_Z
+
+        def tx(lon):
+            return int((lon + 180) / 360 * n)
+
+        def ty(lat):
+            r = math.radians(lat)
+            return int((1 - math.log(math.tan(r) + 1 / math.cos(r)) / math.pi) / 2 * n)
+
+        x0, x1 = tx(NHD_WARM_BBOX[0]), tx(NHD_WARM_BBOX[2])
+        y0, y1 = ty(NHD_WARM_BBOX[3]), ty(NHD_WARM_BBOX[1])
+        cx, cy = tx(NHD_WARM_CENTER[0]), ty(NHD_WARM_CENTER[1])
+        cells = sorted(((x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)),
+                       key=lambda c: (c[0] - cx) ** 2 + (c[1] - cy) ** 2)
+        sem = asyncio.Semaphore(2)
+
+        async def one(x: int, y: int) -> None:
+            key = _nhd_key(x, y)
+            if await _nhd_cell_cached(key):
+                return
+            async with sem:
+                lock = _nhd_locks.setdefault(key, asyncio.Lock())
+                async with lock:
+                    if await _nhd_cell_cached(key):
+                        return
+                    try:
+                        data = await _nhd_build_cell(x, y)
+                        await supabase.table("contour_tile_cache").upsert(
+                            {"cache_key": key, "png_data": "\\x" + data.hex()}, on_conflict="cache_key"
+                        ).execute()
+                    except Exception:
+                        pass  # USGS hiccup; picked up again on the next deploy or by a user request
+                await asyncio.sleep(1)
+
+        for i in range(0, len(cells), 20):
+            await asyncio.gather(*(one(x, y) for x, y in cells[i:i + 20]))
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
+
+
+@app.get("/api/water/nhd")
+async def water_nhd_cell(request: Request, x: int, y: int):
+    """One z12 square of USGS NHD water (streams + waterbodies) as a JSON feature list
+    (gzip). Free layer (Water Sources) -- no subscription check; public USGS data."""
+    n = 2 ** NHD_CELL_Z
+    if not (0 <= x < n and 0 <= y < n):
+        raise HTTPException(status_code=400, detail="invalid cell")
+    key = _nhd_key(x, y)
+    headers = {"Content-Encoding": "gzip", "Cache-Control": "public, max-age=2592000"}
+
+    def ok(data: bytes, source: str) -> Response:
+        return Response(content=data, media_type="application/json", headers={**headers, "X-Tile-Source": source})
+
+    hot = _nhd_hot.get(key)
+    if hot is not None:
+        _nhd_hot.move_to_end(key)
+        return ok(hot, "nhd-hot")
+    lock = _nhd_locks.setdefault(key, asyncio.Lock())
+    try:
+        async with lock:  # many users asking for the same new square -> one USGS fetch
+            if key in _nhd_hot:
+                return ok(_nhd_hot[key], "nhd-hot")
+            cached = await _nhd_cache_get(key)
+            if cached is not None:
+                _nhd_hot_put(key, cached)
+                return ok(cached, "nhd-db")
+            await rate_limit(f"nhd_miss:{client_ip(request)}", limit=60, window_seconds=60)
+            try:
+                data = await _nhd_build_cell(x, y)
+            except Exception as e:
+                return JSONResponse({"error": "upstream unavailable"}, status_code=503,
+                                    headers={"Retry-After": "10", "X-Tile-Error": str(e)[:120]})
+            try:
+                await supabase.table("contour_tile_cache").upsert(
+                    {"cache_key": key, "png_data": "\\x" + data.hex()}, on_conflict="cache_key"
+                ).execute()
+            except Exception:
+                pass
+            _nhd_hot_put(key, data)
+            return ok(data, "nhd-direct")
+    finally:
+        if not lock.locked() and _nhd_locks.get(key) is lock:
+            _nhd_locks.pop(key, None)
 
 
 # ---------------------------------------------------------------------------------------
